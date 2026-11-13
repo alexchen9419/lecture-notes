@@ -1,4 +1,5 @@
-# 上課筆記網頁的後端：匯入音檔 → Breeze-ASR-25 逐字稿 → Gemma 加標點 → Gemma 整理筆記
+# 上課筆記網頁的後端：匯入音檔 → TEA-ASR-1.1（NPU，自帶標點）或 Breeze-ASR-25（CPU）逐字稿 →（Breeze 才需要）Gemma 加標點 → Gemma 整理筆記
+# 另外會讀 Windows 的 Energy Meter，顯示即時功耗、記錄每個步驟用了多少電
 # usage: python lecture_app.py   （然後開 http://127.0.0.1:18484/）
 # 資料都放在 課堂\<日期_時間_課名>\：錄音檔、逐字稿.txt、逐字稿_標點.txt、筆記.md、meta.json
 # live_lecture.py 即時錄的課也在同一個資料夾，網頁裡一樣看得到、可以再加標點和整理筆記。
@@ -27,6 +28,14 @@ LLM_CFG = CFG.get('llm') or {'mode': 'geniex'}
 LLM_MODE = LLM_CFG.get('mode', 'geniex')
 LLM_MODEL = LLM_CFG.get('model') or ('mradermacher/gemma-4-E4B-it-SDFT_Heretic_RP-i1-GGUF:Q4_0' if LLM_MODE == 'geniex' else '')
 GENIEX_PORTS = [18181, 18282]           # 先用使用者自己的伺服器；沒開才自己開 18282
+# 語音辨識：geniex = TEA-ASR-1.1 跑在 Snapdragon NPU（GenieX）｜whisper = Breeze-ASR-25（whisper.cpp，CPU）
+# 這台（沒有 config.json）預設 NPU；可攜版的 config.json 沒寫就維持 whisper。環境變數 LECTURE_ASR 可以臨時切換。
+ASR_CFG = CFG.get('asr') or {}
+ASR_ENGINE = os.environ.get('LECTURE_ASR') or ASR_CFG.get('engine') or ('whisper' if CFG else 'geniex')
+ASR_MODEL_ID = ASR_CFG.get('model') or 'mradermacher/TEA-ASR-1.1-GGUF:Q8_0'
+ASR_GX_PORT = int(ASR_CFG.get('port') or 18282)   # 固定用自己開的伺服器：它有加 --vit-compute CPU（語音編碼器放 NPU 會當掉）
+TEA = ASR_ENGINE == 'geniex'
+PIPELINE = ['asr', 'notes'] if TEA else ['asr', 'punct', 'notes']      # TEA-ASR 自己會加標點，不用再跑「加標點」
 AUDIO_EXT = {'.m4a', '.mp3', '.wav', '.ogg', '.opus', '.webm', '.flac', '.aac', '.mp4', '.mkv', '.mov', '.wma'}
 LINE_RX = re.compile(r'^\[(\d{2}):(\d{2}):(\d{2})\]\s*(.*)$')
 os.makedirs(LECT, exist_ok=True)
@@ -60,6 +69,72 @@ def audio_of(lid):
 def safe_id(lid):
     return lid if lid and '/' not in lid and '\\' not in lid and '..' not in lid and os.path.isdir(os.path.join(LECT, lid)) else None
 
+# ---------- 功耗（Windows 的 Energy Meter 計數器，單位 mW；Snapdragon 會分 CPU／GPU／NPU／記憶體…） ----------
+class PowerMeter:
+    RAILS = ('system', 'soc', 'cpu_cluster_0', 'cpu_cluster_1', 'cpu_cluster_2', 'gpu', 'npu', 'memory')
+
+    def __init__(self):
+        self.ok, self.now, self.energy, self.err = False, {}, {}, ''      # now：瓦；energy：從程式啟動累積的焦耳
+        try:
+            import ctypes
+            from ctypes import c_void_p, c_ulong, c_double, c_wchar_p, byref, POINTER, Structure
+            class Val(Structure): _fields_ = [('status', c_ulong), ('value', c_double)]
+            pdh = ctypes.WinDLL('pdh.dll')
+            pdh.PdhOpenQueryW.argtypes = [c_wchar_p, c_void_p, POINTER(c_void_p)]
+            pdh.PdhAddEnglishCounterW.argtypes = [c_void_p, c_wchar_p, c_void_p, POINTER(c_void_p)]
+            pdh.PdhCollectQueryData.argtypes = [c_void_p]
+            pdh.PdhGetFormattedCounterValue.argtypes = [c_void_p, c_ulong, c_void_p, POINTER(Val)]
+            q = c_void_p()
+            if pdh.PdhOpenQueryW(None, None, byref(q)): raise OSError('PdhOpenQuery 失敗')
+            self.h = {}
+            for r in self.RAILS:
+                h = c_void_p()
+                if pdh.PdhAddEnglishCounterW(q, f'\\Energy Meter({r})\\Power', None, byref(h)) == 0: self.h[r] = h
+            if 'system' not in self.h: raise OSError('這台電腦沒有 Energy Meter 計數器')
+            self.pdh, self.q, self.Val, self.byref = pdh, q, Val, byref
+            pdh.PdhCollectQueryData(q)
+            self.energy = {r: 0.0 for r in self.h}; self.ok = True
+            threading.Thread(target=self.run, daemon=True).start()
+        except Exception as e:
+            self.err = str(e)
+
+    def run(self):
+        last = time.time()
+        while True:
+            time.sleep(1)
+            try:
+                self.pdh.PdhCollectQueryData(self.q)
+                t = time.time(); dt, last = t - last, t
+                for r, h in self.h.items():
+                    v = self.Val()
+                    if self.pdh.PdhGetFormattedCounterValue(h, 0x200 | 0x8000, None, self.byref(v)) == 0:   # DOUBLE | NOCAP100
+                        w = v.value / 1000; self.now[r] = w; self.energy[r] += w * dt
+            except Exception as e:
+                self.err = str(e)
+
+    def watts(self):
+        n = self.now
+        return {'system': n.get('system'), 'soc': n.get('soc'), 'npu': n.get('npu'), 'gpu': n.get('gpu'), 'memory': n.get('memory'),
+                'cpu': sum(n.get(f'cpu_cluster_{i}', 0) for i in range(3)) if n else None}
+
+    def mark(self): return (time.time(), dict(self.energy))
+
+    def since(self, mark):
+        """從 mark() 到現在：秒數、整機平均瓦數、各部分用電（Wh）"""
+        t0, e0 = mark; sec = time.time() - t0
+        d = {r: (self.energy.get(r, 0) - e0.get(r, 0)) / 3600 for r in self.energy}
+        wh = {'system': d.get('system', 0), 'npu': d.get('npu', 0), 'gpu': d.get('gpu', 0),
+              'cpu': sum(d.get(f'cpu_cluster_{i}', 0) for i in range(3))}
+        return {'sec': round(sec), 'avg_w': round(wh['system'] * 3600 / sec, 1) if sec > 0 else 0, 'wh': {k: round(v, 3) for k, v in wh.items()}}
+
+POWER = PowerMeter()
+STEP_NAME = {'asr': '語音辨識', 'punct': '加標點', 'notes': '整理筆記', 'live': '即時錄音'}
+
+def record_energy(lid, step, mark):
+    if not POWER.ok: return
+    e = POWER.since(mark); e['time'] = datetime.datetime.now().isoformat(timespec='seconds'); e['engine'] = ASR_ENGINE if step in ('asr', 'live') else LLM_MODE
+    m = meta_of(lid); m.setdefault('energy', {})[step] = e; save_meta(lid, m)
+
 # ---------- 工作佇列（一次只跑一個，CPU／NPU 不會互搶） ----------
 JOBS = {}          # lid -> {'stage','progress','message','error','done'}
 QUEUE, QLOCK = [], threading.Condition()
@@ -82,7 +157,10 @@ def worker():
                 while LIVE['sess']:
                     set_job(lid, stage='排隊中', message='等即時錄音結束'); time.sleep(2)
             if LLM_MODE == 'none': steps = [s for s in steps if s == 'asr']      # 沒有 AI 模型就只做逐字稿
-            for s in steps: {'asr': run_asr, 'punct': run_punct, 'notes': run_notes}[s](lid)
+            for s in steps:
+                mark = POWER.mark()
+                {'asr': run_asr_tea if TEA else run_asr, 'punct': run_punct, 'notes': run_notes}[s](lid)
+                record_energy(lid, s, mark)
             set_job(lid, stage='完成', progress=100, done=True)
         except Exception as e:
             traceback.print_exc()
@@ -126,6 +204,112 @@ def run_asr(lid):
     except OSError: pass
     if not lines: raise RuntimeError('沒有辨識出任何文字（音檔可能沒有人聲）')
 
+# ---------- 1b. 語音辨識（TEA-ASR-1.1 在 NPU：依停頓切段，每段送 GenieX） ----------
+RATE, FRAME = 16000, 480            # 30 ms 一個 frame
+try:
+    import warnings; warnings.filterwarnings('ignore', category=DeprecationWarning)
+    import audioop
+    def rms16(b): return audioop.rms(b, 2)
+except ImportError:                  # Python 3.13 以後沒有 audioop
+    from array import array
+    def rms16(b): a = array('h', b); return (sum(x * x for x in a) / max(1, len(a))) ** 0.5
+try:
+    from opencc import OpenCC
+    to_trad = OpenCC('s2tw').convert       # TEA 偶爾會冒出簡體字（转、号）
+except Exception:
+    _S2T = str.maketrans('转号这们说时间问题会过还进对应该发现实际开关学习练级数据库网络设计机软处线储盘图书馆课报试讲师为个么样种从两长门见话语读写记让给结构链节点树层选择递归输错误认识准确动态环务质资讯统测验证执运编译码变类体档页队栈键标规划优势杂',
+                         '轉號這們說時間問題會過還進對應該發現實際開關學習練級數據庫網絡設計機軟處線儲盤圖書館課報試講師為個麼樣種從兩長門見話語讀寫記讓給結構鏈節點樹層選擇遞歸輸錯誤認識準確動態環務質資訊統測驗證執運編譯碼變類體檔頁隊棧鍵標規劃優勢雜')
+    def to_trad(s): return s.translate(_S2T)
+
+PUA = re.compile('[-]')     # 這個 GGUF 會在某些字後面多吐一個私用區字元，直接濾掉
+
+def asr_clean(t):
+    t = PUA.sub('', t or '').replace('\r', ' ').replace('\n', ' ')
+    # 前綴「language Chinese<asr_text>」；有時候標籤是中文（language中文），沒聲音時是 language None
+    t = re.sub(r'^\s*language\s*(?:[A-Za-z]+|中文|英文|粵語|日文|韓文)?\s*', '', t).replace('<asr_text>', '')
+    return to_trad(re.sub(r'\s+', ' ', t).strip())
+
+def wav_bytes(pcm):
+    import io, wave
+    buf = io.BytesIO()
+    with wave.open(buf, 'wb') as w: w.setnchannels(1); w.setsampwidth(2); w.setframerate(RATE); w.writeframes(pcm)
+    return buf.getvalue()
+
+def tea_asr(pcm, context=''):
+    """一段 16 kHz 單聲道 PCM（最好 ≤ 30 秒）→ 文字。context 放關鍵字當熱詞（system 一定要有，不然模型只會吐出 language Chinese 就停）"""
+    import base64
+    body = {'model': ASR_MODEL_ID, 'temperature': 0, 'top_k': 1, 'max_tokens': 600, 'stream': False,
+            'messages': [{'role': 'system', 'content': context or ''},
+                         {'role': 'user', 'content': [{'type': 'input_audio', 'input_audio': {'data': base64.b64encode(wav_bytes(pcm)).decode(), 'format': 'wav'}}]}]}
+    for attempt in range(3):          # NPU 偶爾會掛（休眠、過熱後），伺服器死掉就重開再試
+        try:
+            url = geniex_server(ASR_GX_PORT)
+            req = urllib.request.Request(url + '/v1/chat/completions', json.dumps(body).encode(), {'Content-Type': 'application/json'})
+            r = json.load(urllib.request.urlopen(req, timeout=300))
+            return asr_clean(r['choices'][0]['message'].get('content'))
+        except (urllib.error.URLError, ConnectionError, TimeoutError, OSError) as e:
+            if attempt == 2: raise RuntimeError(f'NPU 語音辨識失敗：{e}')
+            time.sleep(3)
+
+class Segmenter:
+    """用音量切段：講到 min_seg 秒以上、遇到 pause 秒的停頓就切；講太久沒停頓，18 秒後只要短短停一下就切，max_seg 秒強制切。"""
+    def __init__(self, min_seg, max_seg, pause):
+        self.min_seg, self.max_seg, self.pause = min_seg, max_seg, pause
+        self.seg, self.start, self.silent, self.voiced, self.noise, self.pos, self.level = bytearray(), 0.0, 0, 0, 300.0, 0, 0.0
+
+    def feed(self, chunk):
+        rms = rms16(chunk)
+        self.level = self.level * 0.8 + min(1.0, rms / 3000) * 0.2
+        speech = rms > max(self.noise * 2.5, 150)
+        if not speech: self.noise = self.noise * 0.995 + rms * 0.005
+        if not self.seg: self.start = self.pos / RATE
+        self.pos += len(chunk) // 2
+        self.seg += chunk; self.silent = 0 if speech else self.silent + 1; self.voiced += speech
+        dur = len(self.seg) / 2 / RATE; quiet = self.silent * FRAME / RATE
+        if (dur >= self.min_seg and quiet >= (self.pause if dur < 18 else 0.2)) or dur >= self.max_seg:
+            return self.cut()
+
+    def cut(self):
+        out = (self.start, bytes(self.seg)) if self.voiced * FRAME / RATE >= 0.5 else None
+        self.seg, self.silent, self.voiced = bytearray(), 0, 0
+        return out
+
+def run_asr_tea(lid):
+    import wave
+    d = os.path.join(LECT, lid); m = meta_of(lid); src = audio_of(lid)
+    if not src: raise RuntimeError('找不到音檔')
+    set_job(lid, stage='轉檔', progress=0, message='把音檔轉成 16 kHz')
+    wav = os.path.join(ROOT, 'tmp', 'asr_16k.wav'); os.makedirs(os.path.dirname(wav), exist_ok=True)
+    subprocess.run([FFMPEG, '-hide_banner', '-loglevel', 'error', '-y', '-i', os.path.join(d, src), '-ac', '1', '-ar', str(RATE), wav], check=True)
+    set_job(lid, stage='語音辨識', progress=0, message='啟動 NPU 語音模型…')
+    geniex_server(ASR_GX_PORT)
+    out_path = os.path.join(d, '逐字稿.txt'); lines = []; ctx = m['keywords'].strip()
+    with wave.open(wav, 'rb') as w:
+        dur = w.getnframes() / RATE
+        m['duration'] = dur; save_meta(lid, m)
+        seg = Segmenter(15, 28, 0.5); t0 = time.time()     # 匯入的音檔不急，段落長一點上下文比較多（太短時 O(1) 會被聽成「哦一」）
+
+        def do(item):
+            start, pcm = item
+            text = tea_asr(pcm, ctx)          # 試過把上一段文字也放進來，反而會稀釋關鍵字（期中→其中），所以只放關鍵字
+            if text and not HALLU.match(text):
+                lines.append(f'[{hms(start)}] {text}'); write(out_path, '\n'.join(lines) + '\n')
+            done = start + len(pcm) / 2 / RATE; el = time.time() - t0; eta = el / max(done, 1) * (dur - done)
+            set_job(lid, progress=min(99, int(done / dur * 100)) if dur else 0,
+                    message=f'已辨識到 {hms(done)} / {hms(dur)}，約剩 {int(eta // 60)} 分 {int(eta % 60)} 秒（NPU）')
+        while True:
+            chunk = w.readframes(FRAME)
+            if len(chunk) < FRAME * 2: break
+            item = seg.feed(chunk)
+            if item: do(item)
+        if len(seg.seg) / 2 / RATE > 1:
+            item = seg.cut()
+            if item: do(item)
+    try: os.remove(wav)
+    except OSError: pass
+    if not lines: raise RuntimeError('沒有辨識出任何文字（音檔可能沒有人聲）')
+    write(os.path.join(d, '逐字稿_標點.txt'), '\n'.join(lines) + '\n')     # TEA 的輸出已經有標點，直接當「逐字稿」
+
 # ---------- AI 模型伺服器（OpenAI 相容 API） ----------
 _llm = {'url': None, 'proc': None, 'lock': threading.Lock()}
 
@@ -146,16 +330,33 @@ def _start_and_wait(cmd, url, secs, what):
         if _alive(url): _llm['url'] = url; return url
     raise RuntimeError(f'{what} 開不起來')
 
+_gx = {'proc': None, 'lock': threading.Lock()}
+
+def geniex_server(port=18282):
+    """確定自己的 GenieX 伺服器（只在 127.0.0.1）有開；沒開或當掉了就重開。"""
+    url = f'http://127.0.0.1:{port}'
+    with _gx['lock']:
+        for _ in range(3):                    # GenieX 在載入／卸載模型時可能幾秒不回應，不要馬上當成沒開
+            if _alive(url): return url
+            time.sleep(1)
+        if _gx['proc'] and _gx['proc'].poll() is None: _gx['proc'].kill(); _gx['proc'].wait()
+        _gx['proc'] = subprocess.Popen(['geniex', 'serve', '-c', 'npu', '--vit-compute', 'CPU', '--host', f'127.0.0.1:{port}',
+                                        '--keepalive', '600', '--skip-update', '--log', 'warn'],
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=ROOT)
+        for _ in range(60):
+            time.sleep(1)
+            if _alive(url): return url
+            if _gx['proc'].poll() is not None and _ > 20: break   # 新開的退出了（多半是埠被原本那個占著）：再等一下原本那個
+        raise RuntimeError('GenieX 開不起來（NPU 可能卡住了，可以重開機再試）')
+
 def llm_url():
     if LLM_MODE == 'none': raise RuntimeError('沒有設定 AI 模型（只能做逐字稿）；要加標點、整理筆記或提問，請重新執行 安裝.bat')
     with _llm['lock']:
         if _llm['url'] and _alive(_llm['url']): return _llm['url']
         if LLM_MODE == 'geniex':
-            for port in GENIEX_PORTS:
+            for port in GENIEX_PORTS[:-1]:
                 if _alive(f'http://127.0.0.1:{port}'): _llm['url'] = f'http://127.0.0.1:{port}'; return _llm['url']
-            # 都沒開：自己開一個（只在 127.0.0.1），程式結束時關掉
-            return _start_and_wait(['geniex', 'serve', '-c', 'npu', '--vit-compute', 'CPU', '--host', '127.0.0.1:18282',
-                                    '--keepalive', '600', '--skip-update', '--log', 'warn'], 'http://127.0.0.1:18282', 60, 'GenieX')
+            _llm['url'] = geniex_server(GENIEX_PORTS[-1]); return _llm['url']     # 沒開：用自己開的那個（跟語音辨識共用）
         if LLM_MODE == 'llama-server':
             port = LLM_CFG.get('port', 18486); url = f'http://127.0.0.1:{port}'
             if _alive(url): _llm['url'] = url; return url
@@ -371,16 +572,21 @@ class Live:
         self.lid = datetime.datetime.now().strftime('%Y-%m-%d_%H%M%S') + ('_' + name if name else '')
         self.dir = os.path.join(LECT, self.lid); os.makedirs(self.dir)
         save_meta(self.lid, {'name': name, 'keywords': keywords, 'source': '即時錄音'})
-        self.t0, self.level, self.lines, self.pending = time.time(), 0.0, [], 0
+        self.t0, self.lines, self.pending, self.keywords, self.srv = time.time(), [], 0, keywords, None
+        self.segm = Segmenter(4, 20, 0.6); self.mark = POWER.mark()
         set_job(self.lid, stage='即時錄音', progress=0, message='啟動中…', error='', done=False)
-        self.srv = subprocess.Popen([SERVER, '-m', arg(MODEL), '-l', 'zh', '-t', THREADS, '--port', str(ASR_PORT), '-nt', '-sns',
-                                     '--vad', '-vm', arg(VAD_MODEL)] + (['--prompt', keywords] if keywords else []),
-                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=ROOT)
-        for _ in range(120):
-            try: urllib.request.urlopen(f'http://127.0.0.1:{ASR_PORT}/', timeout=1); break
-            except Exception: time.sleep(0.5)
+        if TEA:
+            geniex_server(ASR_GX_PORT)
+            tea_asr(b'\0' * RATE * 2, keywords)     # 先用 1 秒靜音把模型載進 NPU，第一句才不會等
         else:
-            self.srv.kill(); raise RuntimeError('辨識伺服器沒有啟動')
+            self.srv = subprocess.Popen([SERVER, '-m', arg(MODEL), '-l', 'zh', '-t', THREADS, '--port', str(ASR_PORT), '-nt', '-sns',
+                                         '--vad', '-vm', arg(VAD_MODEL)] + (['--prompt', keywords] if keywords else []),
+                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=ROOT)
+            for _ in range(120):
+                try: urllib.request.urlopen(f'http://127.0.0.1:{ASR_PORT}/', timeout=1); break
+                except Exception: time.sleep(0.5)
+            else:
+                self.srv.kill(); raise RuntimeError('辨識伺服器沒有啟動')
         # 錄音存成 fragmented m4a：就算程式意外結束，已錄的部分也能播放
         src = ['-re', '-i', os.environ['LIVE_TEST_FILE']] if os.environ.get('LIVE_TEST_FILE') else ['-f', 'dshow', '-i', 'audio=' + mic_device()]   # 測試用：拿音檔當麥克風
         self.ff = subprocess.Popen([FFMPEG, '-hide_banner', '-loglevel', 'error', '-y'] + src + [
@@ -390,12 +596,13 @@ class Live:
         self.tw = threading.Thread(target=self.transcriber, daemon=True); self.tw.start()
         self.tr = threading.Thread(target=self.reader, daemon=True); self.tr.start()
 
+    @property
+    def level(self): return self.segm.level
+
     def post(self, pcm):
-        import io, wave
-        buf = io.BytesIO()
-        with wave.open(buf, 'wb') as w: w.setnchannels(1); w.setsampwidth(2); w.setframerate(RATE); w.writeframes(pcm)
+        if TEA: return tea_asr(pcm, self.keywords)
         b = '----live' + str(time.time_ns())
-        body = (f'--{b}\r\nContent-Disposition: form-data; name="file"; filename="seg.wav"\r\nContent-Type: audio/wav\r\n\r\n').encode() + buf.getvalue() + \
+        body = (f'--{b}\r\nContent-Disposition: form-data; name="file"; filename="seg.wav"\r\nContent-Type: audio/wav\r\n\r\n').encode() + wav_bytes(pcm) + \
                (f'\r\n--{b}\r\nContent-Disposition: form-data; name="response_format"\r\n\r\njson\r\n--{b}--\r\n').encode()
         req = urllib.request.Request(f'http://127.0.0.1:{ASR_PORT}/inference', body, {'Content-Type': f'multipart/form-data; boundary={b}'})
         return json.load(urllib.request.urlopen(req, timeout=120)).get('text', '').strip()
@@ -413,26 +620,18 @@ class Live:
                 write(os.path.join(self.dir, '逐字稿.txt'), '\n'.join(self.lines) + '\n')
 
     def reader(self):
-        from array import array
-        seg, seg_start, silent, noise, pos, voiced = bytearray(), 0.0, 0, 300.0, 0, 0
+        sg = self.segm
         while True:
             chunk = self.ff.stdout.read(FRAME * 2)
             if len(chunk) < FRAME * 2: break
-            a = array('h', chunk); rms = (sum(x * x for x in a) / len(a)) ** 0.5
-            self.level = self.level * 0.8 + min(1.0, rms / 3000) * 0.2
-            pos += FRAME
-            speech = rms > max(noise * 2.5, 150)
-            if not speech: noise = noise * 0.995 + rms * 0.005
-            if not seg: seg_start = (pos - FRAME) / RATE
-            seg += chunk; silent = 0 if speech else silent + 1; voiced += speech
-            dur = len(seg) / 2 / RATE
-            if (dur >= MIN_SEG and silent * FRAME / RATE >= PAUSE) or dur >= MAX_SEG:
-                if voiced * FRAME / RATE >= 0.5: self.pending += 1; self.jobs.put((seg_start, bytes(seg)))
-                seg, silent, voiced = bytearray(), 0, 0
-            if pos % (RATE // 2) < FRAME:
-                set_job(self.lid, message=f'已錄 {hms(pos / RATE)}' + (f'，{self.pending} 段辨識中' if self.pending else ''))
-        if len(seg) / 2 / RATE > 1 and voiced: self.pending += 1; self.jobs.put((seg_start, bytes(seg)))
-        self.recorded = pos / RATE
+            item = sg.feed(chunk)
+            if item: self.pending += 1; self.jobs.put(item)
+            if sg.pos % (RATE // 2) < FRAME:
+                set_job(self.lid, message=f'已錄 {hms(sg.pos / RATE)}' + (f'，{self.pending} 段辨識中' if self.pending else '') + ('（NPU）' if TEA else ''))
+        if len(sg.seg) / 2 / RATE > 1:
+            item = sg.cut()
+            if item: self.pending += 1; self.jobs.put(item)
+        self.recorded = sg.pos / RATE
 
     def stop(self, then_notes):
         set_job(self.lid, message='停止錄音，等最後幾段辨識完…')
@@ -441,10 +640,12 @@ class Live:
         try: self.ff.wait(timeout=15)
         except Exception: self.ff.kill()
         self.tr.join(timeout=30); self.jobs.put(None); self.tw.join(timeout=300)
-        self.srv.terminate()
+        if self.srv: self.srv.terminate()
         m = meta_of(self.lid); m['duration'] = getattr(self, 'recorded', time.time() - self.t0); save_meta(self.lid, m)
+        record_energy(self.lid, 'live', self.mark)
+        if TEA and self.lines: write(os.path.join(self.dir, '逐字稿_標點.txt'), '\n'.join(self.lines) + '\n')
         LIVE['sess'] = None
-        if then_notes and self.lines: enqueue(self.lid, ['punct', 'notes'])
+        if then_notes and self.lines: enqueue(self.lid, ['notes'] if TEA else ['punct', 'notes'])
         else: set_job(self.lid, stage='完成', progress=100, message='', done=True)
 
 # ---------- HTTP ----------
@@ -473,7 +674,9 @@ class H(BaseHTTPRequestHandler):
                             'job': JOBS.get(lid)})
             return self.send(200, out)
         if path == '/api/config':
-            return self.send(200, {'llm': LLM_MODE != 'none', 'llm_mode': LLM_MODE})
+            return self.send(200, {'llm': LLM_MODE != 'none', 'llm_mode': LLM_MODE, 'asr': ASR_ENGINE, 'power': POWER.ok})
+        if path == '/api/power':
+            return self.send(200, {'ok': POWER.ok, 'w': POWER.watts() if POWER.ok else None, 'error': POWER.err})
         if path == '/api/live':
             s = LIVE['sess']
             return self.send(200, {'active': bool(s), 'id': s and s.lid, 'elapsed': s and time.time() - s.t0, 'level': s and round(s.level, 3)})
@@ -483,7 +686,7 @@ class H(BaseHTTPRequestHandler):
             d = os.path.join(LECT, lid); m = meta_of(lid)
             return self.send(200, {'id': lid, 'name': m['name'], 'keywords': m['keywords'], 'duration': m.get('duration'), 'audio': audio_of(lid),
                                    'raw': read(os.path.join(d, '逐字稿.txt')), 'punct': read(os.path.join(d, '逐字稿_標點.txt')),
-                                   'notes': read(os.path.join(d, '筆記.md')), 'job': JOBS.get(lid),
+                                   'notes': read(os.path.join(d, '筆記.md')), 'job': JOBS.get(lid), 'energy': m.get('energy') or {},
                                    'qa': json.loads(read(qa_path(lid), '[]') or '[]')})
         if path.startswith('/media/'):
             lid = safe_id(path.split('/', 2)[2]); f = lid and audio_of(lid)
@@ -529,7 +732,7 @@ class H(BaseHTTPRequestHandler):
                     if not b: break
                     f.write(b); n -= len(b)
             save_meta(lid, {'name': name, 'keywords': q.get('keywords', ''), 'source': fname})
-            enqueue(lid, ['asr', 'punct', 'notes'])
+            enqueue(lid, PIPELINE)
             return self.send(200, {'id': lid})
         if path.startswith('/api/ask/'):
             lid = safe_id(path.split('/', 3)[3])
@@ -594,7 +797,7 @@ class H(BaseHTTPRequestHandler):
             if not lid or step not in ('asr', 'punct', 'notes', 'all'): return self.send(400, {'error': '參數錯誤'})
             if JOBS.get(lid) and not JOBS[lid]['done']: return self.send(409, {'error': '這堂課已經在處理中'})
             if 'keywords' in q: m = meta_of(lid); m['keywords'] = q['keywords']; save_meta(lid, m)
-            enqueue(lid, {'asr': ['asr', 'punct', 'notes'], 'punct': ['punct', 'notes'], 'notes': ['notes'], 'all': ['asr', 'punct', 'notes']}[step])
+            enqueue(lid, {'asr': PIPELINE, 'punct': ['punct', 'notes'], 'notes': ['notes'], 'all': PIPELINE}[step])
             return self.send(200, {'ok': True})
         if path.startswith('/api/save/'):
             lid = safe_id(path.split('/', 3)[3]); kind = q.get('kind')

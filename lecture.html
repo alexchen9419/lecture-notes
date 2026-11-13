@@ -89,6 +89,12 @@ main { overflow-y: auto; min-width: 0; }
 .chk { display: block; font-size: 13px; color: var(--muted); margin-bottom: 8px; }
 textarea.edit { width: 100%; min-height: 60vh; padding: 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); line-height: 1.6; }
 .note { color: var(--muted); font-size: 13px; }
+.pw { margin: 0 12px 6px; padding: 6px 10px; border-radius: 8px; background: var(--bg); font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.pw b { color: var(--ink); font-size: 15px; margin-right: 2px; }
+.pw .rails { display: flex; gap: 10px; flex-wrap: wrap; }
+.pw .npu { color: var(--accent); font-weight: 600; }
+.energy { font-size: 12px; color: var(--muted); margin-top: 6px; }
+.energy span + span::before { content: '｜'; margin: 0 4px; color: var(--line); }
 @media (max-width: 760px) {
   .app { grid-template-columns: 1fr; height: auto; }
   aside { border-right: 0; border-bottom: 1px solid var(--line); max-height: 50vh; }
@@ -100,6 +106,7 @@ textarea.edit { width: 100%; min-height: 60vh; padding: 12px; border: 1px solid 
 <div class="app">
   <aside>
     <h1>上課筆記</h1>
+    <div class="pw" id="pw" hidden></div>
     <div class="import live" id="live">
       <div id="liveIdle">
         <p>即時錄音：邊錄邊出逐字稿，錄音檔也會一起存下來。</p>
@@ -111,7 +118,7 @@ textarea.edit { width: 100%; min-height: 60vh; padding: 12px; border: 1px solid 
       <div id="liveOn" hidden>
         <div class="recrow"><span class="dot"></span><b>錄音中</b><span id="ltime" class="mono">00:00:00</span></div>
         <div class="bar level"><i id="llevel"></i></div>
-        <label class="chk"><input type="checkbox" id="lnotes" checked> 結束後自動加標點、整理筆記</label>
+        <label class="chk"><input type="checkbox" id="lnotes" checked> <span id="lnotesLabel">結束後自動加標點、整理筆記</span></label>
         <button class="btn primary" id="lstop">■ 停止錄音</button>
       </div>
     </div>
@@ -134,7 +141,30 @@ const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '
 const toSec = t => t.split(':').reduce((a, b) => a * 60 + +b, 0);
 const fmtDur = s => s ? `${Math.floor(s / 3600) ? Math.floor(s / 3600) + ' 小時 ' : ''}${Math.round(s % 3600 / 60)} 分` : '';
 let lectures = [], cur = null, data = null, tab = 'notes', editing = false, timer = null, appCfg = { llm: true };
-fetch('/api/config').then(r => r.json()).then(c => appCfg = c).catch(() => {});
+fetch('/api/config').then(r => r.json()).then(c => {
+  appCfg = c;
+  if (c.asr === 'geniex') {      // NPU 的 TEA-ASR 自己會加標點
+    $('#lnotesLabel').textContent = '結束後自動整理筆記';
+    document.querySelector('#drop p').textContent = '匯入音檔（m4a、mp3、wav…），會自動用 NPU 轉逐字稿（含標點）、整理筆記。也可以把檔案拖到這裡。';
+  }
+  if (c.power) { $('#pw').hidden = false; pollPower(); setInterval(pollPower, 1000); }
+}).catch(() => {});
+const W = v => v == null ? '–' : v < 10 ? v.toFixed(2) : v.toFixed(1);
+async function pollPower() {
+  let p; try { p = await (await fetch('/api/power')).json(); } catch { return; }
+  if (!p.ok || !p.w) return;
+  const w = p.w;
+  $('#pw').innerHTML = `<div>功耗 <b>${W(w.system)}</b> W（整機）</div><div class="rails"><span>CPU ${W(w.cpu)} W</span><span class="npu">NPU ${W(w.npu)} W</span><span>GPU ${W(w.gpu)} W</span><span>記憶體 ${W(w.memory)} W</span></div>`;
+}
+const STEP = { asr: '語音辨識', punct: '加標點', notes: '整理筆記', live: '即時錄音' };
+const fmtSec = s => s >= 3600 ? `${Math.floor(s / 3600)} 時 ${Math.floor(s % 3600 / 60)} 分` : s >= 60 ? `${Math.floor(s / 60)} 分 ${s % 60} 秒` : `${s} 秒`;
+const Wh = v => v >= 1 ? v.toFixed(2) + ' Wh' : Math.round(v * 1000) + ' mWh';
+function energyHtml(e) {
+  const ks = ['live', 'asr', 'punct', 'notes'].filter(k => e && e[k]);
+  if (!ks.length) return '';
+  const tot = ks.reduce((a, k) => a + e[k].wh.system, 0);
+  return `<div class="energy" title="整機耗電包含螢幕和背景程式；括號內是 NPU／CPU 各自用的電">耗電：${ks.map(k => `<span>${STEP[k]}${e[k].engine === 'geniex' && (k === 'asr' || k === 'live') ? '（NPU）' : ''} ${fmtSec(e[k].sec)}，平均 ${e[k].avg_w} W，${Wh(e[k].wh.system)}（NPU ${Wh(e[k].wh.npu)}／CPU ${Wh(e[k].wh.cpu)}）</span>`).join('')}${ks.length > 1 ? `<span>合計 ${Wh(tot)}</span>` : ''}</div>`;
+}
 
 // ---------- 匯入 ----------
 let picked = null;
@@ -197,6 +227,7 @@ function render() {
       <h2>${esc(d.name || '（未命名）')} <span class="note">${esc(d.id.slice(0, 10))}　${fmtDur(d.duration)}</span></h2>
       ${isLive(d) ? '<div class="note">錄音中，逐字稿會自動出現在下面；停止後就能播放錄音。</div>' : d.audio ? `<audio id="player" data-id="${esc(d.id)}" controls preload="metadata" src="/media/${encodeURIComponent(d.id)}"></audio>` : '<div class="note">沒有錄音檔</div>'}
       <div id="job">${jobHtml(d.job)}</div>
+      ${energyHtml(d.energy)}
       <div class="tabs">
         ${[['notes', '筆記'], ['punct', '逐字稿'], ['raw', '原始辨識'], ['ask', '提問']].map(([k, v]) => `<span class="tab ${tab === k ? 'on' : ''}" data-tab="${k}">${v}</span>`).join('')}
         <span class="sp"></span>
@@ -367,7 +398,7 @@ async function redo() {
 const isLive = d => d && d.job && d.job.stage === '即時錄音' && !d.job.done;
 let liveOn = false;
 $('#lstart').onclick = async () => {
-  $('#lstart').disabled = true; $('#lmsg').textContent = '啟動中（載入辨識模型約 5 秒）…';
+  $('#lstart').disabled = true; $('#lmsg').textContent = '啟動中（載入辨識模型約 5～15 秒）…';
   const q = new URLSearchParams({ name: $('#lname').value.trim(), keywords: $('#lkw').value.trim() });
   const r = await fetch('/api/live/start?' + q, { method: 'POST' }), j = await r.json();
   $('#lstart').disabled = false;
