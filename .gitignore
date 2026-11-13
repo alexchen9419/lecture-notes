@@ -6,11 +6,9 @@ cpu/
 adreno/
 dl/
 tmp/
+runtime/
 __pycache__/
 *.pyc
-# 舊版備份（舊版已經在 git 歷史裡）
-*.bak.py
-*.bak.html
 # 測試時的錄音和錯誤紀錄
 test/mic3s.wav
 test/lecture_raw.wav

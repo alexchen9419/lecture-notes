@@ -1,4 +1,4 @@
-# 上課筆記網頁的後端：匯入音檔 → TEA-ASR-1.1（NPU，自帶標點）或 Breeze-ASR-25（CPU）逐字稿 →（Breeze 才需要）Gemma 加標點 → Gemma 整理筆記
+# 上課筆記網頁的後端：匯入音檔 → TEA-ASR-1.1（NPU 或 llama.cpp，自帶標點）或 Breeze-ASR-25（whisper.cpp）逐字稿 →（Breeze 才需要）Gemma 加標點 → Gemma 整理筆記
 # 另外會讀 Windows 的 Energy Meter，顯示即時功耗、記錄每個步驟用了多少電
 # usage: python lecture_app.py   （然後開 http://127.0.0.1:18484/）
 # 資料都放在 課堂\<日期_時間_課名>\：錄音檔、逐字稿.txt、逐字稿_標點.txt、筆記.md、meta.json
@@ -7,6 +7,7 @@ import datetime, json, math, mimetypes, os, queue, re, subprocess, sys, threadin
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
+if os.path.isdir(os.path.join(ROOT, 'runtime', 'pylib')): sys.path.insert(0, os.path.join(ROOT, 'runtime', 'pylib'))   # 安裝程式放的 OpenCC
 # 設定檔（可攜版由 安裝.bat 產生）；沒有設定檔就用這台電腦原本的路徑和 GenieX
 CFG = json.loads(open(os.path.join(ROOT, 'config.json'), encoding='utf-8-sig').read()) if os.path.exists(os.path.join(ROOT, 'config.json')) else {}
 def rel(v): return v if os.path.isabs(v) else os.path.join(ROOT, v)      # 設定檔裡的相對路徑都以程式所在資料夾為準
@@ -28,13 +29,15 @@ LLM_CFG = CFG.get('llm') or {'mode': 'geniex'}
 LLM_MODE = LLM_CFG.get('mode', 'geniex')
 LLM_MODEL = LLM_CFG.get('model') or ('mradermacher/gemma-4-E4B-it-SDFT_Heretic_RP-i1-GGUF:Q4_0' if LLM_MODE == 'geniex' else '')
 GENIEX_PORTS = [18181, 18282]           # 先用使用者自己的伺服器；沒開才自己開 18282
-# 語音辨識：geniex = TEA-ASR-1.1 跑在 Snapdragon NPU（GenieX）｜whisper = Breeze-ASR-25（whisper.cpp，CPU）
+# 語音辨識：geniex = TEA-ASR-1.1 跑在 Snapdragon NPU（GenieX）｜llama-server = TEA-ASR-1.1 用 llama.cpp 跑（CPU／GPU，任何電腦）
+#           whisper = Breeze-ASR-25（whisper.cpp，CPU）
 # 這台（沒有 config.json）預設 NPU；可攜版的 config.json 沒寫就維持 whisper。環境變數 LECTURE_ASR 可以臨時切換。
 ASR_CFG = CFG.get('asr') or {}
 ASR_ENGINE = os.environ.get('LECTURE_ASR') or ASR_CFG.get('engine') or ('whisper' if CFG else 'geniex')
 ASR_MODEL_ID = ASR_CFG.get('model') or 'mradermacher/TEA-ASR-1.1-GGUF:Q8_0'
 ASR_GX_PORT = int(ASR_CFG.get('port') or 18282)   # 固定用自己開的伺服器：它有加 --vit-compute CPU（語音編碼器放 NPU 會當掉）
-TEA = ASR_ENGINE == 'geniex'
+TEA = ASR_ENGINE in ('geniex', 'llama-server')
+ASR_TAG = {'geniex': '（NPU）', 'llama-server': '（TEA）'}.get(ASR_ENGINE, '')
 PIPELINE = ['asr', 'notes'] if TEA else ['asr', 'punct', 'notes']      # TEA-ASR 自己會加標點，不用再跑「加標點」
 AUDIO_EXT = {'.m4a', '.mp3', '.wav', '.ogg', '.opus', '.webm', '.flac', '.aac', '.mp4', '.mkv', '.mov', '.wma'}
 LINE_RX = re.compile(r'^\[(\d{2}):(\d{2}):(\d{2})\]\s*(.*)$')
@@ -243,12 +246,12 @@ def tea_asr(pcm, context=''):
                          {'role': 'user', 'content': [{'type': 'input_audio', 'input_audio': {'data': base64.b64encode(wav_bytes(pcm)).decode(), 'format': 'wav'}}]}]}
     for attempt in range(3):          # NPU 偶爾會掛（休眠、過熱後），伺服器死掉就重開再試
         try:
-            url = geniex_server(ASR_GX_PORT)
+            url = asr_server()
             req = urllib.request.Request(url + '/v1/chat/completions', json.dumps(body).encode(), {'Content-Type': 'application/json'})
             r = json.load(urllib.request.urlopen(req, timeout=300))
             return asr_clean(r['choices'][0]['message'].get('content'))
         except (urllib.error.URLError, ConnectionError, TimeoutError, OSError) as e:
-            if attempt == 2: raise RuntimeError(f'NPU 語音辨識失敗：{e}')
+            if attempt == 2: raise RuntimeError(f'語音辨識失敗：{e}')
             time.sleep(3)
 
 class Segmenter:
@@ -281,8 +284,8 @@ def run_asr_tea(lid):
     set_job(lid, stage='轉檔', progress=0, message='把音檔轉成 16 kHz')
     wav = os.path.join(ROOT, 'tmp', 'asr_16k.wav'); os.makedirs(os.path.dirname(wav), exist_ok=True)
     subprocess.run([FFMPEG, '-hide_banner', '-loglevel', 'error', '-y', '-i', os.path.join(d, src), '-ac', '1', '-ar', str(RATE), wav], check=True)
-    set_job(lid, stage='語音辨識', progress=0, message='啟動 NPU 語音模型…')
-    geniex_server(ASR_GX_PORT)
+    set_job(lid, stage='語音辨識', progress=0, message='載入語音模型…')
+    asr_server()
     out_path = os.path.join(d, '逐字稿.txt'); lines = []; ctx = m['keywords'].strip()
     with wave.open(wav, 'rb') as w:
         dur = w.getnframes() / RATE
@@ -296,7 +299,7 @@ def run_asr_tea(lid):
                 lines.append(f'[{hms(start)}] {text}'); write(out_path, '\n'.join(lines) + '\n')
             done = start + len(pcm) / 2 / RATE; el = time.time() - t0; eta = el / max(done, 1) * (dur - done)
             set_job(lid, progress=min(99, int(done / dur * 100)) if dur else 0,
-                    message=f'已辨識到 {hms(done)} / {hms(dur)}，約剩 {int(eta // 60)} 分 {int(eta % 60)} 秒（NPU）')
+                    message=f'已辨識到 {hms(done)} / {hms(dur)}，約剩 {int(eta // 60)} 分 {int(eta % 60)} 秒{ASR_TAG}')
         while True:
             chunk = w.readframes(FRAME)
             if len(chunk) < FRAME * 2: break
@@ -348,6 +351,39 @@ def geniex_server(port=18282):
             if _alive(url): return url
             if _gx['proc'].poll() is not None and _ > 20: break   # 新開的退出了（多半是埠被原本那個占著）：再等一下原本那個
         raise RuntimeError('GenieX 開不起來（NPU 可能卡住了，可以重開機再試）')
+
+_asr = {'proc': None, 'url': None, 'lock': threading.Lock()}
+
+def asr_server():
+    """TEA-ASR 的伺服器網址：geniex → 自己開的 GenieX（NPU）；llama-server → 另外開一個 llama-server 專門跑 TEA-ASR。"""
+    if ASR_ENGINE == 'geniex': return geniex_server(ASR_GX_PORT)
+    port = int(ASR_CFG.get('port') or 18487); url = f'http://127.0.0.1:{port}'
+    with _asr['lock']:
+        if _alive(url): return url
+        server = rel(ASR_CFG.get('server') or LLM_CFG.get('server') or 'llama-server')
+        cmd = [server, '-m', arg(rel(ASR_CFG['gguf'])), '--mmproj', arg(rel(ASR_CFG['mmproj'])), '--host', '127.0.0.1', '--port', str(port),
+               '-c', '4096']
+        def start(ngl):
+            if _asr['proc'] and _asr['proc'].poll() is None: _asr['proc'].kill(); _asr['proc'].wait()
+            _asr['proc'] = subprocess.Popen(cmd + ['-ngl', str(ngl)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=ROOT)
+            for _ in range(180):
+                time.sleep(1)
+                if _asr['proc'].poll() is not None: raise RuntimeError('語音辨識伺服器（llama-server）啟動失敗')
+                if _alive(url): return
+            raise RuntimeError('語音辨識伺服器（llama-server）開不起來')
+        gpu = int(ASR_CFG.get('gpu_layers', 0))
+        if gpu:
+            # 先試 GPU：用一小段靜音測一次，失敗（有些顯示卡驅動不支援）就改成只用 CPU
+            try:
+                start(gpu)
+                body = {'model': 'x', 'temperature': 0, 'max_tokens': 16, 'messages': [{'role': 'system', 'content': ''}, {'role': 'user', 'content': [
+                    {'type': 'input_audio', 'input_audio': {'data': __import__('base64').b64encode(wav_bytes(b'\0' * RATE)).decode(), 'format': 'wav'}}]}]}
+                urllib.request.urlopen(urllib.request.Request(url + '/v1/chat/completions', json.dumps(body).encode(), {'Content-Type': 'application/json'}), timeout=120)
+                return url
+            except Exception:
+                print('語音辨識用 GPU 跑不正常，改成只用 CPU', flush=True)
+        start(0)
+        return url
 
 def llm_url():
     if LLM_MODE == 'none': raise RuntimeError('沒有設定 AI 模型（只能做逐字稿）；要加標點、整理筆記或提問，請重新執行 安裝.bat')
@@ -576,7 +612,7 @@ class Live:
         self.segm = Segmenter(4, 20, 0.6); self.mark = POWER.mark()
         set_job(self.lid, stage='即時錄音', progress=0, message='啟動中…', error='', done=False)
         if TEA:
-            geniex_server(ASR_GX_PORT)
+            asr_server()
             tea_asr(b'\0' * RATE * 2, keywords)     # 先用 1 秒靜音把模型載進 NPU，第一句才不會等
         else:
             self.srv = subprocess.Popen([SERVER, '-m', arg(MODEL), '-l', 'zh', '-t', THREADS, '--port', str(ASR_PORT), '-nt', '-sns',
@@ -627,7 +663,7 @@ class Live:
             item = sg.feed(chunk)
             if item: self.pending += 1; self.jobs.put(item)
             if sg.pos % (RATE // 2) < FRAME:
-                set_job(self.lid, message=f'已錄 {hms(sg.pos / RATE)}' + (f'，{self.pending} 段辨識中' if self.pending else '') + ('（NPU）' if TEA else ''))
+                set_job(self.lid, message=f'已錄 {hms(sg.pos / RATE)}' + (f'，{self.pending} 段辨識中' if self.pending else '') + ASR_TAG)
         if len(sg.seg) / 2 / RATE > 1:
             item = sg.cut()
             if item: self.pending += 1; self.jobs.put(item)
@@ -674,7 +710,7 @@ class H(BaseHTTPRequestHandler):
                             'job': JOBS.get(lid)})
             return self.send(200, out)
         if path == '/api/config':
-            return self.send(200, {'llm': LLM_MODE != 'none', 'llm_mode': LLM_MODE, 'asr': ASR_ENGINE, 'power': POWER.ok})
+            return self.send(200, {'llm': LLM_MODE != 'none', 'llm_mode': LLM_MODE, 'asr': ASR_ENGINE, 'tea': TEA, 'power': POWER.ok})
         if path == '/api/power':
             return self.send(200, {'ok': POWER.ok, 'w': POWER.watts() if POWER.ok else None, 'error': POWER.err})
         if path == '/api/live':

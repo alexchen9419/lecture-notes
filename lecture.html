@@ -143,9 +143,9 @@ const fmtDur = s => s ? `${Math.floor(s / 3600) ? Math.floor(s / 3600) + ' 小�
 let lectures = [], cur = null, data = null, tab = 'notes', editing = false, timer = null, appCfg = { llm: true };
 fetch('/api/config').then(r => r.json()).then(c => {
   appCfg = c;
-  if (c.asr === 'geniex') {      // NPU 的 TEA-ASR 自己會加標點
+  if (c.tea) {                   // TEA-ASR 自己會加標點
     $('#lnotesLabel').textContent = '結束後自動整理筆記';
-    document.querySelector('#drop p').textContent = '匯入音檔（m4a、mp3、wav…），會自動用 NPU 轉逐字稿（含標點）、整理筆記。也可以把檔案拖到這裡。';
+    document.querySelector('#drop p').textContent = `匯入音檔（m4a、mp3、wav…），會自動${c.asr === 'geniex' ? '用 NPU ' : ''}轉逐字稿（含標點）、整理筆記。也可以把檔案拖到這裡。`;
   }
   if (c.power) { $('#pw').hidden = false; pollPower(); setInterval(pollPower, 1000); }
 }).catch(() => {});

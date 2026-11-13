@@ -1,3 +1,5 @@
 # .bat 是 cp950 編碼、CRLF 換行，原封不動保存
 *.bat -text
 *.wav binary
+# PowerShell 5.1 要有 BOM 才認得 UTF-8
+*.ps1 -text
