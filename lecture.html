@@ -1,0 +1,418 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>上課筆記</title>
+<style>
+:root {
+  --bg: #f6f5f1; --panel: #ffffff; --ink: #1f2328; --muted: #6b6f76; --line: #e3e1db;
+  --accent: #2f6f5e; --accent-soft: #e3efe9; --warn: #a1532a; --hl: #fff3c4; --code: #f0eee8;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #17191c; --panel: #1f2226; --ink: #e6e6e3; --muted: #9a9ea5; --line: #33373d;
+    --accent: #6fbfa5; --accent-soft: #23352f; --warn: #e39a72; --hl: #4a4220; --code: #2a2d32;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.7 "Microsoft JhengHei", "Noto Sans TC", system-ui, sans-serif; }
+button, input, textarea { font: inherit; color: inherit; }
+.app { display: grid; grid-template-columns: 300px 1fr; height: 100vh; }
+aside { border-right: 1px solid var(--line); background: var(--panel); display: flex; flex-direction: column; min-height: 0; }
+aside h1 { font-size: 18px; margin: 0; padding: 16px 16px 8px; letter-spacing: .05em; }
+.import { margin: 8px 12px 12px; padding: 12px; border: 1.5px dashed var(--line); border-radius: 10px; }
+.import.drag { border-color: var(--accent); background: var(--accent-soft); }
+.import p { margin: 0 0 8px; color: var(--muted); font-size: 13px; }
+.import input[type=text] { width: 100%; margin-bottom: 6px; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); }
+.file-row { display: flex; gap: 6px; align-items: center; margin-bottom: 8px; font-size: 13px; }
+.file-row span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); flex: 1; }
+.btn { border: 1px solid var(--line); background: var(--panel); border-radius: 6px; padding: 5px 10px; cursor: pointer; white-space: nowrap; }
+.btn:hover { border-color: var(--accent); }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.btn:disabled { opacity: .5; cursor: default; }
+.list { overflow-y: auto; flex: 1; padding: 0 8px 12px; }
+.item { padding: 8px 10px; border-radius: 8px; cursor: pointer; margin-bottom: 2px; }
+.item:hover { background: var(--bg); }
+.item.on { background: var(--accent-soft); }
+.item .t { font-weight: 600; }
+.item .s { font-size: 12px; color: var(--muted); }
+.badge { display: inline-block; font-size: 11px; padding: 0 6px; border-radius: 9px; background: var(--code); margin-left: 4px; }
+.badge.run { background: var(--accent); color: #fff; }
+.badge.err { background: var(--warn); color: #fff; }
+main { overflow-y: auto; min-width: 0; }
+.empty { color: var(--muted); padding: 80px 32px; text-align: center; }
+.head { position: sticky; top: 0; background: var(--bg); padding: 16px 28px 10px; border-bottom: 1px solid var(--line); z-index: 2; }
+.head h2 { margin: 0 0 8px; font-size: 20px; }
+.head audio { width: 100%; height: 36px; }
+.prog { margin-top: 8px; font-size: 13px; color: var(--muted); }
+.bar { height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; margin-top: 4px; }
+.bar i { display: block; height: 100%; background: var(--accent); transition: width .4s; }
+.err { color: var(--warn); }
+.tabs { display: flex; gap: 4px; margin-top: 10px; flex-wrap: wrap; align-items: center; }
+.tab { padding: 4px 12px; border-radius: 6px; cursor: pointer; border: 1px solid transparent; }
+.tab.on { background: var(--panel); border-color: var(--line); font-weight: 600; }
+.tabs .sp { flex: 1; }
+.body { padding: 20px 28px 80px; max-width: 900px; }
+.tline { display: flex; gap: 12px; padding: 3px 6px; border-radius: 6px; }
+.tline.cur { background: var(--hl); }
+.ts { color: var(--accent); cursor: pointer; font-variant-numeric: tabular-nums; flex: none; font-size: 13px; padding-top: 2px; }
+.ts:hover { text-decoration: underline; }
+.md h1 { font-size: 22px; margin: 4px 0 12px; }
+.md h2 { font-size: 18px; margin: 22px 0 8px; padding-bottom: 4px; border-bottom: 1px solid var(--line); }
+.md h3 { font-size: 16px; margin: 16px 0 6px; }
+.md ul, .md ol { padding-left: 22px; margin: 4px 0; }
+.md code { background: var(--code); padding: 0 4px; border-radius: 4px; }
+.md table { border-collapse: collapse; margin: 8px 0; }
+.md td, .md th { border: 1px solid var(--line); padding: 4px 8px; }
+.qa { margin-bottom: 18px; }
+.qa .q { font-weight: 600; background: var(--accent-soft); padding: 8px 12px; border-radius: 10px 10px 10px 2px; display: inline-block; }
+.qa .a { padding: 6px 2px 0; }
+.qa .a p { margin: 4px 0; }
+.srcs { font-size: 13px; color: var(--muted); margin-top: 4px; }
+.srcs summary { cursor: pointer; }
+.src { padding: 4px 8px; border-left: 2px solid var(--line); margin: 4px 0; cursor: pointer; }
+.src:hover { border-color: var(--accent); }
+.src .kind { font-size: 11px; background: var(--code); border-radius: 4px; padding: 0 4px; margin: 0 4px; }
+.askbox { position: sticky; bottom: 0; background: var(--bg); padding: 10px 0 4px; border-top: 1px solid var(--line); margin-top: 12px; }
+.askbox textarea { width: 100%; resize: vertical; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); }
+.askrow { display: flex; justify-content: space-between; align-items: center; margin-top: 6px; }
+.askrow .chk { margin: 0; }
+.import.live { border-style: solid; }
+.btn.rec { color: #c62828; border-color: currentColor; font-weight: 600; }
+.recrow { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.recrow .mono { margin-left: auto; font-variant-numeric: tabular-nums; }
+.dot { width: 10px; height: 10px; border-radius: 50%; background: #e53935; animation: blink 1.2s infinite; }
+@keyframes blink { 50% { opacity: .25; } }
+.bar.level { margin: 0 0 8px; }
+.bar.level i { transition: width .15s; }
+.chk { display: block; font-size: 13px; color: var(--muted); margin-bottom: 8px; }
+textarea.edit { width: 100%; min-height: 60vh; padding: 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); line-height: 1.6; }
+.note { color: var(--muted); font-size: 13px; }
+@media (max-width: 760px) {
+  .app { grid-template-columns: 1fr; height: auto; }
+  aside { border-right: 0; border-bottom: 1px solid var(--line); max-height: 50vh; }
+  .head, .body { padding-left: 16px; padding-right: 16px; }
+}
+</style>
+</head>
+<body>
+<div class="app">
+  <aside>
+    <h1>上課筆記</h1>
+    <div class="import live" id="live">
+      <div id="liveIdle">
+        <p>即時錄音：邊錄邊出逐字稿，錄音檔也會一起存下來。</p>
+        <input type="text" id="lname" placeholder="課名（可留空）">
+        <input type="text" id="lkw" placeholder="關鍵字／專有名詞，用逗號分隔">
+        <button class="btn rec" id="lstart">● 開始錄音</button>
+        <div class="prog" id="lmsg"></div>
+      </div>
+      <div id="liveOn" hidden>
+        <div class="recrow"><span class="dot"></span><b>錄音中</b><span id="ltime" class="mono">00:00:00</span></div>
+        <div class="bar level"><i id="llevel"></i></div>
+        <label class="chk"><input type="checkbox" id="lnotes" checked> 結束後自動加標點、整理筆記</label>
+        <button class="btn primary" id="lstop">■ 停止錄音</button>
+      </div>
+    </div>
+    <div class="import" id="drop">
+      <p>匯入音檔（m4a、mp3、wav…），會自動轉逐字稿、加標點、整理筆記。也可以把檔案拖到這裡。</p>
+      <div class="file-row"><button class="btn" id="pick">選擇檔案</button><span id="fname">尚未選擇</span></div>
+      <input type="file" id="file" accept="audio/*,video/*" hidden>
+      <input type="text" id="name" placeholder="課名（可留空）">
+      <input type="text" id="kw" placeholder="關鍵字／專有名詞，用逗號分隔">
+      <button class="btn primary" id="up" disabled>開始處理</button>
+      <div class="prog" id="upmsg"></div>
+    </div>
+    <div class="list" id="list"></div>
+  </aside>
+  <main id="main"><div class="empty">從左邊匯入音檔，或選一堂課。<br>用 <b>上課錄音.bat</b> 即時錄的課也會出現在這裡。</div></main>
+</div>
+<script>
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const toSec = t => t.split(':').reduce((a, b) => a * 60 + +b, 0);
+const fmtDur = s => s ? `${Math.floor(s / 3600) ? Math.floor(s / 3600) + ' 小時 ' : ''}${Math.round(s % 3600 / 60)} 分` : '';
+let lectures = [], cur = null, data = null, tab = 'notes', editing = false, timer = null, appCfg = { llm: true };
+fetch('/api/config').then(r => r.json()).then(c => appCfg = c).catch(() => {});
+
+// ---------- 匯入 ----------
+let picked = null;
+function pick(f) { picked = f; $('#fname').textContent = f ? f.name : '尚未選擇'; $('#up').disabled = !f; if (f && !$('#name').value) $('#name').value = f.name.replace(/\.[^.]+$/, ''); }
+$('#pick').onclick = () => $('#file').click();
+$('#file').onchange = e => pick(e.target.files[0]);
+const drop = $('#drop');
+['dragenter', 'dragover'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add('drag'); }));
+['dragleave', 'drop'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove('drag'); }));
+drop.addEventListener('drop', e => e.dataTransfer.files[0] && pick(e.dataTransfer.files[0]));
+$('#up').onclick = () => {
+  const q = new URLSearchParams({ filename: picked.name, name: $('#name').value.trim(), keywords: $('#kw').value.trim() });
+  const x = new XMLHttpRequest(); x.open('POST', '/api/upload?' + q);
+  $('#up').disabled = true;
+  x.upload.onprogress = e => $('#upmsg').textContent = `上傳中 ${Math.round(e.loaded / e.total * 100)}%`;
+  x.onload = () => {
+    const r = JSON.parse(x.responseText || '{}');
+    if (x.status !== 200) { $('#upmsg').innerHTML = `<span class="err">${esc(r.error || '上傳失敗')}</span>`; $('#up').disabled = false; return; }
+    $('#upmsg').textContent = '已加入處理佇列'; pick(null); $('#name').value = ''; $('#kw').value = '';
+    loadList().then(() => open(r.id));
+  };
+  x.onerror = () => { $('#upmsg').innerHTML = '<span class="err">上傳失敗，後端程式有開嗎？</span>'; $('#up').disabled = false; };
+  x.send(picked);
+};
+
+// ---------- 清單 ----------
+function badge(l) {
+  const j = l.job;
+  if (j && !j.done) return `<span class="badge run">${esc(j.stage)}${j.progress ? ' ' + j.progress + '%' : ''}</span>`;
+  if (j && j.error) return '<span class="badge err">失敗</span>';
+  return l.has.notes ? '<span class="badge">筆記</span>' : l.has.punct ? '<span class="badge">逐字稿</span>' : l.has.raw ? '<span class="badge">原始稿</span>' : '';
+}
+async function loadList() {
+  lectures = await (await fetch('/api/lectures')).json();
+  $('#list').innerHTML = lectures.map(l => `<div class="item ${l.id === cur ? 'on' : ''}" data-id="${esc(l.id)}">
+    <div class="t">${esc(l.name || '（未命名）')}${badge(l)}</div>
+    <div class="s">${esc(l.id.slice(0, 10))} ${esc(l.id.slice(11, 13))}:${esc(l.id.slice(13, 15))}　${fmtDur(l.duration)}</div></div>`).join('');
+  $('#list').querySelectorAll('.item').forEach(el => el.onclick = () => open(el.dataset.id));
+}
+
+// ---------- 單堂課 ----------
+async function open(id, keepTab) {
+  if (id !== cur) { editing = false; if (!keepTab) tab = 'notes'; }
+  cur = id; data = await (await fetch('/api/lecture/' + encodeURIComponent(id))).json();
+  if (!keepTab && !data.notes) tab = data.punct ? 'punct' : 'raw';
+  render(); loadList();
+}
+function jobHtml(j) {
+  if (!j) return '';
+  if (j.error) return `<div class="prog err">處理失敗（${esc(j.stage)}）：${esc(j.error)}</div>`;
+  if (j.done) return '';
+  if (j.stage === '即時錄音') return `<div class="prog"><span class="dot" style="display:inline-block;margin-right:6px"></span>${esc(j.message || '')}</div>`;
+  return `<div class="prog">${esc(j.stage)}　${esc(j.message || '')}<div class="bar"><i style="width:${j.progress || 2}%"></i></div></div>`;
+}
+function render() {
+  const d = data, busy = d.job && !d.job.done;
+  const audio = document.querySelector('#player');
+  const keepTime = audio && audio.dataset.id === d.id ? audio.currentTime : 0, playing = audio && !audio.paused && audio.dataset.id === d.id;
+  $('#main').innerHTML = `<div class="head">
+      <h2>${esc(d.name || '（未命名）')} <span class="note">${esc(d.id.slice(0, 10))}　${fmtDur(d.duration)}</span></h2>
+      ${isLive(d) ? '<div class="note">錄音中，逐字稿會自動出現在下面；停止後就能播放錄音。</div>' : d.audio ? `<audio id="player" data-id="${esc(d.id)}" controls preload="metadata" src="/media/${encodeURIComponent(d.id)}"></audio>` : '<div class="note">沒有錄音檔</div>'}
+      <div id="job">${jobHtml(d.job)}</div>
+      <div class="tabs">
+        ${[['notes', '筆記'], ['punct', '逐字稿'], ['raw', '原始辨識'], ['ask', '提問']].map(([k, v]) => `<span class="tab ${tab === k ? 'on' : ''}" data-tab="${k}">${v}</span>`).join('')}
+        <span class="sp"></span>
+        ${tab === 'ask' ? `<button class="btn" id="qaclear" ${(d.qa || []).length ? '' : 'disabled'}>清除提問紀錄</button>` : `
+        ${tab !== 'raw' ? `<button class="btn" id="edit" ${busy ? 'disabled' : ''}>${editing ? '儲存' : '編輯'}</button>` : ''}
+        <button class="btn" id="dl">下載</button>
+        <button class="btn" id="redo" ${busy ? 'disabled' : ''}>${tab === 'notes' ? '重新整理筆記' : tab === 'punct' ? '重新加標點' : '重新辨識'}</button>`}
+      </div></div>
+    <div class="body" id="body"></div>`;
+  const p = document.querySelector('#player');
+  if (p) { if (keepTime) p.currentTime = keepTime; if (playing) p.play(); p.ontimeupdate = highlight; }
+  document.querySelectorAll('.tab').forEach(t => t.onclick = () => { if (editing) return; tab = t.dataset.tab; render(); });
+  if ($('#dl')) $('#dl').onclick = download;
+  if ($('#redo')) $('#redo').onclick = redo;
+  if ($('#edit')) $('#edit').onclick = toggleEdit;
+  if ($('#qaclear')) $('#qaclear').onclick = async () => {
+    if (!confirm('清除這堂課的所有提問紀錄？')) return;
+    await fetch('/api/qa_clear/' + encodeURIComponent(cur), { method: 'POST' }); data.qa = []; render();
+  };
+  renderBody();
+}
+function renderBody() {
+  const d = data, body = $('#body');
+  if (!appCfg.llm && tab !== 'raw') {
+    body.innerHTML = '<div class="note">這台電腦沒有設定 AI 模型，所以只有「原始辨識」的逐字稿。要加標點、整理筆記和提問，請重新執行 <b>安裝.bat</b> 選一個 AI 模型。</div>';
+    return;
+  }
+  if (tab === 'ask') return renderAsk(body);
+  const text = tab === 'notes' ? d.notes : tab === 'punct' ? d.punct : d.raw;
+  if (editing) { body.innerHTML = `<textarea class="edit" id="ed">${esc(text)}</textarea>`; return; }
+  if (!text) {
+    const busy = d.job && !d.job.done;
+    body.innerHTML = `<div class="note">${busy ? '處理中，完成後會自動顯示。' : tab === 'notes' ? '還沒有筆記，按右上角「重新整理筆記」產生。' : tab === 'punct' ? '還沒有加標點的逐字稿，按「重新加標點」。' : '還沒有逐字稿。'}</div>`;
+    if (busy && tab !== 'raw' && d.raw) body.innerHTML += '<div class="note" style="margin-top:8px">可以先看「原始辨識」。</div>';
+    return;
+  }
+  if (tab === 'notes') body.innerHTML = `<div class="md">${md(text)}</div>`;
+  else body.innerHTML = text.split('\n').filter(Boolean).map(l => {
+    const m = l.match(/^\[(\d\d:\d\d:\d\d)\]\s*(.*)$/);
+    return m ? `<div class="tline" data-t="${toSec(m[1])}"><span class="ts" data-seek="${toSec(m[1])}">${m[1]}</span><span>${esc(m[2])}</span></div>` : `<div class="tline"><span>${esc(l)}</span></div>`;
+  }).join('');
+  body.querySelectorAll('[data-seek]').forEach(el => el.onclick = () => seek(+el.dataset.seek));
+}
+function seek(t) { const p = $('#player'); if (!p) return; p.currentTime = t; p.play(); }
+// 跳到別堂課的某個時間
+async function openAndSeek(lid, t) {
+  if (lid !== cur) { await open(lid, true); tab = 'punct'; render(); }
+  const p = $('#player'); if (!p) return;
+  const go = () => { p.currentTime = t; p.play(); };
+  p.readyState >= 1 ? go() : p.addEventListener('loadedmetadata', go, { once: true });
+}
+
+// ---------- 提問（RAG） ----------
+let asking = false, askAll = false;
+function qaCard(item, live) {
+  const src = (item.sources || []).map(s => `<div class="src" data-lid="${esc(s.lid)}" data-t="${s.t ? toSec(s.t) : ''}">
+      <span class="ts">${esc(s.name)} ${esc(s.t || '')}</span><span class="kind">${esc(s.kind)}</span> ${esc(s.text)}…</div>`).join('');
+  return `<div class="qa"><div class="q">${esc(item.q)}${item.all ? '<span class="badge">全部課堂</span>' : ''}</div>
+    <div class="a md">${item.a ? md(item.a) : live ? '<span class="note">思考中…</span>' : ''}</div>
+    ${src ? `<details class="srcs"${live ? ' open' : ''}><summary>參考片段（${item.sources.length}）</summary>${src}</details>` : ''}</div>`;
+}
+function renderAsk(body) {
+  const list = data.qa || [];
+  body.innerHTML = `<div id="qalist">${list.length ? list.map(x => qaCard(x)).join('') :
+      '<div class="note">問這堂課的內容，例如「期中考範圍是什麼？」「chaining 跟 open addressing 差在哪？」。回答會附上出處時間，點了就能聽那一段。</div>'}</div>
+    <form id="askform" class="askbox">
+      <textarea id="askq" rows="2" placeholder="輸入問題，Enter 送出（Shift+Enter 換行）" ${asking ? 'disabled' : ''}></textarea>
+      <div class="askrow"><label class="chk"><input type="checkbox" id="askall" ${askAll ? 'checked' : ''}> 搜尋所有課堂</label>
+      <button class="btn primary" ${asking ? 'disabled' : ''}>${asking ? '回答中…' : '送出'}</button></div></form>`;
+  bindCites(body);
+  $('#askall').onchange = e => askAll = e.target.checked;
+  $('#askq').onkeydown = e => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); $('#askform').requestSubmit(); } };
+  $('#askform').onsubmit = e => { e.preventDefault(); ask($('#askq').value.trim()); };
+  if (!asking) $('#askq').focus();
+}
+function bindCites(root) {
+  root.querySelectorAll('.src').forEach(el => el.onclick = () => el.dataset.t !== '' && openAndSeek(el.dataset.lid, +el.dataset.t));
+  root.querySelectorAll('.a [data-seek]').forEach(el => el.onclick = () => {
+    const card = el.closest('.qa'), name = el.dataset.name || '';
+    const src = [...card.querySelectorAll('.src')].find(s => name && s.querySelector('.ts').textContent.startsWith(name));
+    openAndSeek(src ? src.dataset.lid : cur, +el.dataset.seek);
+  });
+}
+async function ask(q) {
+  if (!q || asking) return;
+  asking = true; const lid = cur, item = { q, a: '', all: askAll, sources: [] };
+  data.qa = [...(data.qa || []), item]; renderBody();
+  const cardEl = () => [...document.querySelectorAll('#qalist .qa')].at(-1);
+  const paint = live => { if (cur !== lid || tab !== 'ask') return; const el = cardEl(); if (el) { el.outerHTML = qaCard(item, live); bindCites($('#qalist')); } $('#main').scrollTop = $('#main').scrollHeight; };
+  try {
+    const r = await fetch('/api/ask/' + encodeURIComponent(lid), { method: 'POST', body: JSON.stringify({ q, all: askAll }) });
+    if (!r.ok) throw new Error((await r.json()).error || '提問失敗');
+    const reader = r.body.getReader(), dec = new TextDecoder(); let buf = '';
+    for (;;) {
+      const { value, done } = await reader.read(); if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let i; while ((i = buf.indexOf('\n')) >= 0) {
+        const o = JSON.parse(buf.slice(0, i)); buf = buf.slice(i + 1);
+        if (o.sources) item.sources = o.sources;
+        if (o.delta) item.a += o.delta;
+        if (o.answer) item.a = o.answer;
+        if (o.error) item.a += `\n\n（發生錯誤：${o.error}）`;
+        paint(!o.done);
+      }
+    }
+  } catch (e) { item.a = `（發生錯誤：${e.message}）`; }
+  asking = false; paint(false);
+  if (cur === lid) {          // 以伺服器存好的紀錄為準（輪詢可能已經把 data 換掉）
+    try { data.qa = (await (await fetch('/api/lecture/' + encodeURIComponent(lid))).json()).qa; } catch {}
+    if (tab === 'ask') render();
+  }
+}
+function highlight() {
+  const t = $('#player').currentTime, lines = [...document.querySelectorAll('.tline[data-t]')];
+  let hit = null; for (const l of lines) { if (+l.dataset.t <= t + 0.3) hit = l; else break; }
+  lines.forEach(l => l.classList.toggle('cur', l === hit));
+}
+
+// 簡單的 Markdown（標題、條列、粗體、行內程式碼、表格），時間標記可以點
+function md(src) {
+  const inline = s => esc(s).replace(/\*\*(.+?)\*\*/g, '<b>$1</b>').replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/[（(]([^（）()\d]{0,24}?)\s*((?:\d{1,2}:)?\d{1,2}:\d{2})(?:\s*[～~-]\s*(?:\d{1,2}:)?\d{1,2}:\d{2})?[）)]/g,
+      (m, name, a) => `<span class="ts" data-seek="${toSec(a)}" data-name="${name.trim()}">${m}</span>`);
+  const out = []; let list = null, table = null;
+  const close = () => { if (list) { out.push(`</${list}>`); list = null; } if (table) { out.push('</table>'); table = null; } };
+  for (const raw of src.split('\n')) {
+    const l = raw.replace(/\s+$/, '');
+    let m;
+    if ((m = l.match(/^(#{1,4})\s+(.*)/))) { close(); out.push(`<h${m[1].length}>${inline(m[2])}</h${m[1].length}>`); }
+    else if ((m = l.match(/^\s*[-*•]\s+(.*)/))) { if (list !== 'ul') { close(); out.push('<ul>'); list = 'ul'; } out.push(`<li>${inline(m[1])}</li>`); }
+    else if ((m = l.match(/^\s*\d+[.)、]\s+(.*)/))) { if (list !== 'ol') { close(); out.push('<ol>'); list = 'ol'; } out.push(`<li>${inline(m[1])}</li>`); }
+    else if (/^\s*\|.*\|\s*$/.test(l)) {
+      if (/^\s*\|[\s:|-]+\|\s*$/.test(l)) continue;
+      if (!table) { close(); out.push('<table>'); table = true; }
+      out.push('<tr>' + l.trim().slice(1, -1).split('|').map(c => `<td>${inline(c.trim())}</td>`).join('') + '</tr>');
+    }
+    else if (!l.trim()) close();
+    else { close(); out.push(`<p>${inline(l)}</p>`); }
+  }
+  close(); return out.join('');
+}
+
+async function toggleEdit() {
+  if (!editing) { editing = true; render(); return; }
+  const kind = tab === 'notes' ? 'notes' : 'punct', text = $('#ed').value;
+  await fetch(`/api/save/${encodeURIComponent(cur)}?kind=${kind}`, { method: 'POST', body: text });
+  data[kind] = text; editing = false; render();
+}
+function download() {
+  const text = tab === 'notes' ? data.notes : tab === 'punct' ? data.punct : data.raw;
+  const ext = tab === 'notes' ? 'md' : 'txt', label = tab === 'notes' ? '筆記' : tab === 'punct' ? '逐字稿' : '原始辨識';
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([text || ''], { type: 'text/plain;charset=utf-8' }));
+  a.download = `${data.name || data.id}_${label}.${ext}`; a.click();
+}
+async function redo() {
+  const step = tab === 'notes' ? 'notes' : tab === 'punct' ? 'punct' : 'asr';
+  const msg = { notes: '重新整理筆記？目前的筆記會被覆蓋。', punct: '重新加標點？之後也會重新整理筆記，手動修改過的內容會被覆蓋。', asr: '重新辨識整個音檔？逐字稿和筆記都會重做。' }[step];
+  let kw = data.keywords || '';
+  if (step === 'asr' || step === 'punct') { const k = prompt(msg + '\n\n關鍵字／專有名詞（可修改）：', kw); if (k === null) return; kw = k; }
+  else if (!confirm(msg)) return;
+  const r = await fetch(`/api/run/${encodeURIComponent(cur)}?step=${step}&keywords=${encodeURIComponent(kw)}`, { method: 'POST' });
+  if (!r.ok) alert((await r.json()).error || '失敗');
+  open(cur, true);
+}
+
+// ---------- 即時錄音 ----------
+const isLive = d => d && d.job && d.job.stage === '即時錄音' && !d.job.done;
+let liveOn = false;
+$('#lstart').onclick = async () => {
+  $('#lstart').disabled = true; $('#lmsg').textContent = '啟動中（載入辨識模型約 5 秒）…';
+  const q = new URLSearchParams({ name: $('#lname').value.trim(), keywords: $('#lkw').value.trim() });
+  const r = await fetch('/api/live/start?' + q, { method: 'POST' }), j = await r.json();
+  $('#lstart').disabled = false;
+  if (!r.ok) { $('#lmsg').innerHTML = `<span class="err">${esc(j.error || '無法開始錄音')}</span>`; return; }
+  $('#lmsg').textContent = ''; $('#lname').value = ''; $('#lkw').value = '';
+  tab = 'raw'; await loadList(); open(j.id, true); pollLive();
+};
+$('#lstop').onclick = async () => {
+  if (!confirm('停止錄音？')) return;
+  $('#lstop').disabled = true;
+  await fetch('/api/live/stop?notes=' + ($('#lnotes').checked ? 1 : 0), { method: 'POST' });
+  $('#lstop').disabled = false; pollLive();
+};
+async function pollLive() {
+  let s; try { s = await (await fetch('/api/live')).json(); } catch { return; }
+  liveOn = s.active;
+  $('#liveIdle').hidden = s.active; $('#liveOn').hidden = !s.active;
+  if (s.active) {
+    const e = Math.floor(s.elapsed); $('#ltime').textContent = [e / 3600, e % 3600 / 60, e % 60].map(x => String(Math.floor(x)).padStart(2, '0')).join(':');
+    $('#llevel').style.width = Math.min(100, Math.round(Math.sqrt(s.level) * 100)) + '%';
+  }
+}
+setInterval(pollLive, 500); pollLive();
+
+// 處理中就每 2 秒更新
+setInterval(async () => {
+  const active = lectures.some(l => l.job && !l.job.done);
+  if (!active && !(data && data.job && !data.job.done)) return;
+  await loadList();
+  if (cur && !editing) {
+    const was = data && data.job && !data.job.done;
+    const nd = await (await fetch('/api/lecture/' + encodeURIComponent(cur))).json();
+    const changed = nd.raw !== data.raw || nd.punct !== data.punct || nd.notes !== data.notes || (was && nd.job && nd.job.done);
+    const main = $('#main'), atBottom = main.scrollHeight - main.scrollTop - main.clientHeight < 80;
+    const stageChanged = (data.job && data.job.stage) !== (nd.job && nd.job.stage);
+    data = nd;
+    if (changed || stageChanged) {
+      if (was && nd.job && nd.job.done && nd.notes) tab = 'notes';
+      render();
+      if (isLive(nd) && atBottom) main.scrollTop = main.scrollHeight;   // 錄音中自動捲到最新一行
+    }
+    else $('#job').innerHTML = jobHtml(nd.job);
+  }
+}, 2000);
+loadList();
+</script>
+</body>
+</html>

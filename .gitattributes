@@ -1,0 +1,3 @@
+# .bat 是 cp950 編碼、CRLF 換行，原封不動保存
+*.bat -text
+*.wav binary

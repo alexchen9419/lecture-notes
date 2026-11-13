@@ -1,0 +1,18 @@
+# 上課資料（私人）
+課堂/
+# 模型、執行檔、下載檔、暫存（太大或可以重新下載）
+models/
+cpu/
+adreno/
+dl/
+tmp/
+__pycache__/
+*.pyc
+# 舊版備份（舊版已經在 git 歷史裡）
+*.bak.py
+*.bak.html
+# 測試時的錄音和錯誤紀錄
+test/mic3s.wav
+test/lecture_raw.wav
+test/err_*.txt
+config.json

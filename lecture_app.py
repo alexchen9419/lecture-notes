@@ -1,0 +1,623 @@
+# 上課筆記網頁的後端：匯入音檔 → Breeze-ASR-25 逐字稿 → Gemma 加標點 → Gemma 整理筆記
+# usage: python lecture_app.py   （然後開 http://127.0.0.1:18484/）
+# 資料都放在 課堂\<日期_時間_課名>\：錄音檔、逐字稿.txt、逐字稿_標點.txt、筆記.md、meta.json
+# live_lecture.py 即時錄的課也在同一個資料夾，網頁裡一樣看得到、可以再加標點和整理筆記。
+import datetime, json, math, mimetypes, os, queue, re, subprocess, sys, threading, time, traceback, urllib.parse, urllib.request
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+# 設定檔（可攜版由 安裝.bat 產生）；沒有設定檔就用這台電腦原本的路徑和 GenieX
+CFG = json.loads(open(os.path.join(ROOT, 'config.json'), encoding='utf-8-sig').read()) if os.path.exists(os.path.join(ROOT, 'config.json')) else {}
+def rel(v): return v if os.path.isabs(v) else os.path.join(ROOT, v)      # 設定檔裡的相對路徑都以程式所在資料夾為準
+def cfg_path(key, default): return rel(CFG.get(key) or default)
+# whisper.cpp 讀模型時不支援含中文的路徑（例如資料夾叫「上課筆記可攜版」會直接當掉）：
+# 子程式一律在 ROOT 執行，ROOT 底下的檔案改傳相對路徑（models\…）
+def arg(p): return os.path.relpath(p, ROOT) if os.path.abspath(p).lower().startswith(ROOT.lower() + os.sep) else p
+LECT = os.environ.get('LECTURE_DIR') or cfg_path('lectures_dir', '課堂')     # 測試時可以換資料夾
+WHISPER_DIR = cfg_path('whisper_dir', os.path.join('cpu', 'Release'))
+CLI = os.path.join(WHISPER_DIR, 'whisper-cli.exe')
+MODEL = cfg_path('asr_model', os.path.join('models', 'ggml-breeze-asr-25-q8_0.bin'))
+VAD_MODEL = cfg_path('vad_model', os.path.join('models', 'ggml-silero-v5.1.2.bin'))
+FFMPEG = cfg_path('ffmpeg', 'ffmpeg') if CFG.get('ffmpeg') else 'ffmpeg'
+FFPROBE = cfg_path('ffprobe', 'ffprobe') if CFG.get('ffprobe') else 'ffprobe'
+THREADS = str(CFG.get('threads') or max(4, min(12, (os.cpu_count() or 8) - 2)))
+PORT = int(os.environ.get('LECTURE_PORT') or CFG.get('port') or 18484)
+# AI 模型：geniex（Snapdragon NPU）｜llama-server（可攜版自帶）｜openai（Ollama、LM Studio 等已經在跑的伺服器）｜none（只做逐字稿）
+LLM_CFG = CFG.get('llm') or {'mode': 'geniex'}
+LLM_MODE = LLM_CFG.get('mode', 'geniex')
+LLM_MODEL = LLM_CFG.get('model') or ('mradermacher/gemma-4-E4B-it-SDFT_Heretic_RP-i1-GGUF:Q4_0' if LLM_MODE == 'geniex' else '')
+GENIEX_PORTS = [18181, 18282]           # 先用使用者自己的伺服器；沒開才自己開 18282
+AUDIO_EXT = {'.m4a', '.mp3', '.wav', '.ogg', '.opus', '.webm', '.flac', '.aac', '.mp4', '.mkv', '.mov', '.wma'}
+LINE_RX = re.compile(r'^\[(\d{2}):(\d{2}):(\d{2})\]\s*(.*)$')
+os.makedirs(LECT, exist_ok=True)
+
+# ---------- 小工具 ----------
+def hms(sec):
+    sec = int(sec); return f'{sec // 3600:02d}:{sec % 3600 // 60:02d}:{sec % 60:02d}'
+
+def read(path, default=''):
+    try: return open(path, encoding='utf-8').read()
+    except OSError: return default
+
+def write(path, text):
+    tmp = path + '.tmp'
+    open(tmp, 'w', encoding='utf-8').write(text); os.replace(tmp, path)
+
+def meta_of(lid):
+    m = json.loads(read(os.path.join(LECT, lid, 'meta.json'), '{}') or '{}')
+    m.setdefault('name', lid.split('_', 2)[2] if lid.count('_') >= 2 else '')
+    m.setdefault('keywords', '')
+    return m
+
+def save_meta(lid, m): write(os.path.join(LECT, lid, 'meta.json'), json.dumps(m, ensure_ascii=False, indent=1))
+
+def audio_of(lid):
+    d = os.path.join(LECT, lid)
+    for f in sorted(os.listdir(d)):
+        if os.path.splitext(f)[1].lower() in AUDIO_EXT and not f.startswith('_'): return f
+    return None
+
+def safe_id(lid):
+    return lid if lid and '/' not in lid and '\\' not in lid and '..' not in lid and os.path.isdir(os.path.join(LECT, lid)) else None
+
+# ---------- 工作佇列（一次只跑一個，CPU／NPU 不會互搶） ----------
+JOBS = {}          # lid -> {'stage','progress','message','error','done'}
+QUEUE, QLOCK = [], threading.Condition()
+
+def set_job(lid, **kw):
+    j = JOBS.setdefault(lid, {'stage': '', 'progress': 0, 'message': '', 'error': '', 'done': False})
+    j.update(kw)
+
+def enqueue(lid, steps):
+    set_job(lid, stage='排隊中', progress=0, message='', error='', done=False)
+    with QLOCK: QUEUE.append((lid, steps)); QLOCK.notify()
+
+def worker():
+    while True:
+        with QLOCK:
+            while not QUEUE: QLOCK.wait()
+            lid, steps = QUEUE.pop(0)
+        try:
+            if 'asr' in steps:                # 即時錄音時 CPU 已經在跑辨識，匯入的音檔等錄完再處理
+                while LIVE['sess']:
+                    set_job(lid, stage='排隊中', message='等即時錄音結束'); time.sleep(2)
+            if LLM_MODE == 'none': steps = [s for s in steps if s == 'asr']      # 沒有 AI 模型就只做逐字稿
+            for s in steps: {'asr': run_asr, 'punct': run_punct, 'notes': run_notes}[s](lid)
+            set_job(lid, stage='完成', progress=100, done=True)
+        except Exception as e:
+            traceback.print_exc()
+            set_job(lid, stage='失敗', error=str(e), done=True)
+
+# ---------- 1. 語音辨識（whisper-cli，邊辨識邊寫進逐字稿.txt） ----------
+def run_asr(lid):
+    d = os.path.join(LECT, lid); m = meta_of(lid); src = audio_of(lid)
+    if not src: raise RuntimeError('找不到音檔')
+    set_job(lid, stage='轉檔', progress=0, message='把音檔轉成 16 kHz')
+    wav = os.path.join(ROOT, 'tmp', 'asr_16k.wav'); os.makedirs(os.path.dirname(wav), exist_ok=True)   # 英文路徑，whisper 才讀得到
+    subprocess.run([FFMPEG, '-hide_banner', '-loglevel', 'error', '-y', '-i', os.path.join(d, src), '-ac', '1', '-ar', '16000', wav], check=True)
+    dur = float(subprocess.run([FFPROBE, '-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', wav], capture_output=True, text=True).stdout.strip() or 0)
+    m['duration'] = dur; save_meta(lid, m)
+    set_job(lid, stage='語音辨識', progress=0, message=f'音檔長 {hms(dur)}')
+    cmd = [CLI, '-m', arg(MODEL), '-f', arg(wav), '-l', 'zh', '-t', THREADS, '-sns', '--vad', '-vm', arg(VAD_MODEL)]
+    if m['keywords'].strip(): cmd += ['--prompt', m['keywords'].strip()]
+    out_path = os.path.join(d, '逐字稿.txt'); lines = []
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, cwd=ROOT)
+    seg_rx = re.compile(r'^\[(\d+):(\d+):([\d.]+)\s*-->\s*(\d+):(\d+):([\d.]+)\]\s*(.*)$')
+    t0 = time.time(); last_end, cur_len = -99.0, 0
+    for raw in p.stdout:
+        s = raw.decode('utf-8', 'replace').strip()
+        mm = seg_rx.match(s)
+        if not mm: continue
+        start = int(mm[1]) * 3600 + int(mm[2]) * 60 + float(mm[3]); end = int(mm[4]) * 3600 + int(mm[5]) * 60 + float(mm[6])
+        text = mm[7].strip()
+        if not text: continue
+        # VAD 會把一句話切得很碎：停頓不到 1.5 秒、而且這行還不到 45 字，就接在同一行
+        if lines and start - last_end < 1.5 and cur_len + len(text) <= 45:
+            lines[-1] += ' ' + text; cur_len += len(text)
+        else:
+            lines.append(f'[{hms(start)}] {text}'); cur_len = len(text)
+        last_end = end
+        write(out_path, '\n'.join(lines) + '\n')
+        pct = min(99, int(start / dur * 100)) if dur else 0
+        el = time.time() - t0; eta = el / max(start, 1) * (dur - start)
+        set_job(lid, progress=pct, message=f'已辨識到 {hms(start)} / {hms(dur)}，約剩 {int(eta // 60)} 分 {int(eta % 60)} 秒')
+    if p.wait() != 0: raise RuntimeError('whisper 辨識失敗')
+    try: os.remove(wav)
+    except OSError: pass
+    if not lines: raise RuntimeError('沒有辨識出任何文字（音檔可能沒有人聲）')
+
+# ---------- AI 模型伺服器（OpenAI 相容 API） ----------
+_llm = {'url': None, 'proc': None, 'lock': threading.Lock()}
+
+def _alive(url):
+    # llama-server 在模型還沒載入完時 /v1/models 就會回應，要看 /health（載入中回 503）；沒有 /health 的伺服器（GenieX、Ollama）才看 /v1/models
+    try: urllib.request.urlopen(url + '/health', timeout=2); return True
+    except urllib.error.HTTPError as e:
+        if e.code == 503: return False
+    except Exception: return False
+    try: urllib.request.urlopen(url + '/v1/models', timeout=2); return True
+    except Exception: return False
+
+def _start_and_wait(cmd, url, secs, what):
+    _llm['proc'] = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=ROOT)
+    for _ in range(secs):
+        time.sleep(1)
+        if _llm['proc'].poll() is not None: raise RuntimeError(f'{what} 啟動失敗')
+        if _alive(url): _llm['url'] = url; return url
+    raise RuntimeError(f'{what} 開不起來')
+
+def llm_url():
+    if LLM_MODE == 'none': raise RuntimeError('沒有設定 AI 模型（只能做逐字稿）；要加標點、整理筆記或提問，請重新執行 安裝.bat')
+    with _llm['lock']:
+        if _llm['url'] and _alive(_llm['url']): return _llm['url']
+        if LLM_MODE == 'geniex':
+            for port in GENIEX_PORTS:
+                if _alive(f'http://127.0.0.1:{port}'): _llm['url'] = f'http://127.0.0.1:{port}'; return _llm['url']
+            # 都沒開：自己開一個（只在 127.0.0.1），程式結束時關掉
+            return _start_and_wait(['geniex', 'serve', '-c', 'npu', '--vit-compute', 'CPU', '--host', '127.0.0.1:18282',
+                                    '--keepalive', '600', '--skip-update', '--log', 'warn'], 'http://127.0.0.1:18282', 60, 'GenieX')
+        if LLM_MODE == 'llama-server':
+            port = LLM_CFG.get('port', 18486); url = f'http://127.0.0.1:{port}'
+            if _alive(url): _llm['url'] = url; return url
+            cmd = [rel(LLM_CFG['server']), '-m', arg(rel(LLM_CFG['gguf'])), '--host', '127.0.0.1', '--port', str(port),
+                   '-c', str(LLM_CFG.get('ctx', 8192)), '--jinja', '--reasoning-format', 'deepseek']
+            gpu = int(LLM_CFG.get('gpu_layers', 0))
+            if gpu:
+                # 先用 GPU（Vulkan）；開不起來、或試問一題答不出來／答得亂七八糟，就改成只用 CPU（有些顯示卡驅動對 Vulkan 支援不好）
+                try:
+                    _start_and_wait(cmd + ['-ngl', str(gpu)], url, 300, 'AI 模型（llama-server）')   # 第一次載入 5 GB 模型可能要一兩分鐘
+                    probe = {'model': 'x', 'messages': [{'role': 'user', 'content': '請只回答一個字：好'}], 'max_tokens': 16, 'temperature': 0,
+                             'chat_template_kwargs': {'enable_thinking': False}}
+                    r = json.load(urllib.request.urlopen(urllib.request.Request(url + '/v1/chat/completions', json.dumps(probe).encode(),
+                                                                                {'Content-Type': 'application/json'}), timeout=90))
+                    if '好' in (r['choices'][0]['message'].get('content') or ''): return url
+                except Exception: pass
+                print('AI 模型用 GPU 跑不正常，改成只用 CPU', flush=True)
+                if _llm['proc'] and _llm['proc'].poll() is None: _llm['proc'].kill(); _llm['proc'].wait()
+                _llm['url'] = None
+            return _start_and_wait(cmd + ['-ngl', '0'], url, 300, 'AI 模型（llama-server）')
+        url = LLM_CFG.get('url', 'http://127.0.0.1:11434').rstrip('/')               # openai：Ollama、LM Studio…
+        if not _alive(url): raise RuntimeError(f'連不到 AI 模型伺服器 {url}，請先打開 Ollama 或 LM Studio')
+        _llm['url'] = url; return url
+
+def llm_body(messages, max_tokens, temperature, stream=False):
+    model = LLM_MODEL
+    if not model:                                   # 沒指定就用伺服器上的第一個模型
+        model = json.load(urllib.request.urlopen(llm_url() + '/v1/models', timeout=5))['data'][0]['id']
+    body = {'model': model, 'messages': messages, 'max_tokens': max_tokens, 'temperature': temperature, 'stream': stream}
+    # 關掉「先思考」：各家伺服器的參數不同，不認得的欄位會被忽略
+    if LLM_MODE == 'geniex': body.update(nctx=8192, enable_think=False, reasoning_effort='none')
+    elif LLM_MODE == 'llama-server': body['chat_template_kwargs'] = {'enable_thinking': False}
+    return body
+
+def llm(system, user, max_tokens=3000):
+    body = llm_body([{'role': 'system', 'content': system}, {'role': 'user', 'content': user}], max_tokens, 0.2)
+    req = urllib.request.Request(llm_url() + '/v1/chat/completions', json.dumps(body).encode(), {'Content-Type': 'application/json'})
+    r = json.load(urllib.request.urlopen(req, timeout=3600))   # 慢的電腦寫一段筆記可能要好幾分鐘
+    text = (r['choices'][0]['message'].get('content') or '').strip()
+    return re.sub(r'<think>[\s\S]*?</think>', '', text).strip()
+
+def chunks(lines, limit):
+    out, cur, n = [], [], 0
+    for l in lines:
+        if cur and n + len(l) > limit: out.append(cur); cur, n = [], 0
+        cur.append(l); n += len(l)
+    if cur: out.append(cur)
+    return out
+
+TOPIC_RX = re.compile(r'^\[\d{2}:\d{2}:\d{2}\]\s*(好[，,。 ]|好了|那接下來|接下來|那我們|我們來|我們再|另外|最後|再來|下面|下一個|OK|okay)', re.I)
+
+def topic_chunks(lines, limit):
+    """跟 chunks() 一樣切段，但會往回找老師換話題的那一行（「好，」「接下來」…）再切，例子比較不會被切成兩半。"""
+    out, cur, n = [], [], 0
+    for l in lines:
+        if cur and n + len(l) > limit:
+            cut = next((k for k in range(len(cur) - 1, max(0, len(cur) - 10), -1) if TOPIC_RX.match(cur[k])), None)
+            if cut: out.append(cur[:cut]); cur = cur[cut:]
+            else: out.append(cur); cur = []
+            n = sum(map(len, cur))
+        cur.append(l); n += len(l)
+    if cur: out.append(cur)
+    return out
+
+def unlatex(s):
+    for a, b in [('\\rightarrow', '→'), ('\\Rightarrow', '⇒'), ('\\leftarrow', '←'), ('\\to', '→'), ('\\times', '×'), ('\\div', '÷'),
+                 ('\\cdot', '·'), ('\\leq', '≤'), ('\\geq', '≥'), ('\\le', '≤'), ('\\ge', '≥'), ('\\neq', '≠'), ('\\approx', '≈'), ('\\log', 'log')]:
+        s = s.replace(a, b)
+    s = re.sub(r'\\(?:text|mathrm|mathbf|textbf)\{([^{}]*)\}', r'\1', s)
+    s = re.sub(r'\\frac\{([^{}]*)\}\{([^{}]*)\}', r'(\1)/(\2)', s)
+    s = re.sub(r'\$+([^$\n]*?)\$+', r'\1', s)          # 拿掉 $…$
+    return s
+
+# ---------- 2. 加標點 ----------
+PUNCT_SYS = ('你是上課逐字稿的校對助手。輸入是語音辨識的逐字稿，每行開頭是 [時:分:秒]。\n'
+             '請：1. 加上全形標點符號；2. 修正語音辨識常見的同音錯字，要依上課情境判斷（例如作業是「交」不是「教」：「教作業」→「交作業」；「其中考」→「期中考」），'
+             '不確定就保留原字；3. 英文術語保持原樣；4. 不要增加、刪除或改寫內容；5. 不要用 LaTeX 或 $ 符號，O(n) 就寫 O(n)。\n'
+             '輸出：行數和時間戳都跟輸入完全一樣，每行「[時:分:秒] 文字」，不要任何開場白或說明。')
+
+def run_punct(lid):
+    d = os.path.join(LECT, lid); m = meta_of(lid)
+    lines = [l for l in read(os.path.join(d, '逐字稿.txt')).splitlines() if LINE_RX.match(l)]
+    if not lines: raise RuntimeError('還沒有逐字稿')
+    parts = chunks(lines, 1200); done = []
+    kw = f'\n這堂課的關鍵字：{m["keywords"]}' if m['keywords'].strip() else ''
+    for i, part in enumerate(parts):
+        set_job(lid, stage='加標點', progress=int(i / len(parts) * 100), message=f'第 {i + 1} / {len(parts)} 段')
+        got = {}
+        for l in unlatex(llm(PUNCT_SYS + kw, '\n'.join(part))).splitlines():
+            mm = LINE_RX.match(l.strip())
+            if mm: got.setdefault(f'{mm[1]}:{mm[2]}:{mm[3]}', mm[4].strip())
+        for l in part:                       # 模型漏掉的行就用原文
+            mm = LINE_RX.match(l); key = f'{mm[1]}:{mm[2]}:{mm[3]}'
+            done.append(f'[{key}] {got.get(key) or mm[4]}')
+        write(os.path.join(d, '逐字稿_標點.txt'), '\n'.join(done) + '\n')
+
+# ---------- 3. 整理筆記 ----------
+# 筆記分兩步：每段逐字稿各自寫成「詳細筆記」直接放進「內容整理」（不再二次濃縮，細節才不會被壓掉）；
+# 再根據這些詳細筆記寫總覽（本堂重點、名詞解釋、作業考試、待確認）。
+NOTE_PART_SYS = ('你是很會做筆記的學生，要把一段課堂逐字稿（每行有 [時:分:秒]）整理成「詳細的」上課筆記，讓沒來上課的同學看筆記就能學會。繁體中文，Markdown，不要用 LaTeX。\n'
+                 '寫法：\n'
+                 '1. 依主題分成「### 小標題」，標題要具體（例如「### 碰撞處理：Chaining」，不要寫「### 第一部分」）。\n'
+                 '2. 每個概念都要寫清楚：是什麼（定義）、為什麼需要、怎麼運作（步驟或流程用編號條列）、老師舉的例子或比喻、優缺點或和其他方法的比較、時間或空間複雜度、公式或數字。逐字稿有講到的都要寫進去，不要只寫一句話帶過。\n'
+                 '3. 保留老師的說明方式和舉的例子；老師說「很重要」「會考」「要注意」「常錯」的地方，在句首加「★」。\n'
+                 '4. 每個條列最後標時間，例如（00:12:30）。\n'
+                 '5. 交代的事項（作業、報告、考試、日期、繳交方式、要預習的章節）也要寫進對應的地方。\n'
+                 '6. 只根據逐字稿，不要補充逐字稿沒講的課本知識；可能是語音辨識錯字或聽不懂的地方標「（？）」。\n'
+                 '7. 不要開場白和結語，直接從 ### 開始；不要用課名當標題；不要寫「逐字稿中斷」之類的註記。')
+NOTE_FINAL_SYS = ('你是很會做筆記的學生。下面是一堂課的詳細筆記，請寫這堂課的「總覽」，繁體中文，Markdown，不要用 LaTeX。\n'
+                  '只輸出下面這五個部分，標題文字照抄、不要加括號說明，也不要重寫詳細內容：\n'
+                  '# <課名>：<這堂課的主題>\n'
+                  '## 本堂重點\n（條列 4～8 點，每點一兩句話，涵蓋整堂課的主要概念和結論，後面標時間如（00:12:30））\n'
+                  '## 名詞解釋\n（用表格：| 名詞 | 英文 | 說明 |，列出筆記中所有重要術語，說明用一兩句話，只根據筆記內容）\n'
+                  '## 作業／考試／重要日期\n（條列：作業、報告、考試的內容、時間、範圍、繳交方式、遲交規定；老師說「會考」「必考」的主題（筆記中標★的）；要預習的章節。每點標時間；都沒有就寫「無」）\n'
+                  '## 待確認\n（列出筆記中標「（？）」或意思不清楚、可能是辨識錯字的地方；沒有就寫「無」）\n'
+                  '只根據提供的筆記，不要編造。')
+
+def run_notes(lid):
+    d = os.path.join(LECT, lid); m = meta_of(lid)
+    src = read(os.path.join(d, '逐字稿_標點.txt')) or read(os.path.join(d, '逐字稿.txt'))
+    lines = [l for l in src.splitlines() if LINE_RX.match(l)]
+    if not lines: raise RuntimeError('還沒有逐字稿')
+    head = f'課名：{m["name"] or "（未命名）"}；日期：{lid[:10]}' + (f'；關鍵字：{m["keywords"]}' if m['keywords'].strip() else '')
+    parts = topic_chunks(lines, 2400); detail = []
+    title_rx = re.compile(r'^###\s*' + re.escape(m['name']) + r'\s*([：:].*)?$', re.M) if m['name'] else None
+    for i, part in enumerate(parts):
+        set_job(lid, stage='整理筆記', progress=int(i / (len(parts) + 1) * 100), message=f'寫第 {i + 1} / {len(parts)} 段的詳細筆記')
+        body = unlatex(llm(NOTE_PART_SYS, head + '\n\n逐字稿：\n' + '\n'.join(part), 3500)).strip()
+        body = re.sub(r'^#{1,2}\s', '### ', body, flags=re.M)          # 小節一律用 ###，才不會跟總覽的 ## 混在一起
+        if title_rx: body = title_rx.sub('', body).strip()              # 拿掉用課名當的標題
+        detail.append(body)
+        write(os.path.join(d, '_詳細筆記.md'), '\n\n'.join(detail))   # 寫到一半也看得到進度
+    set_job(lid, stage='整理筆記', progress=int(len(parts) / (len(parts) + 1) * 100), message='寫總覽（重點、名詞、作業考試）')
+    overview = unlatex(llm(NOTE_FINAL_SYS, head + '\n\n詳細筆記：\n' + '\n\n'.join(detail), 3000)).strip()
+    overview = re.sub(r'^##\s*內容整理[\s\S]*?(?=^##\s)', '', overview, flags=re.M)   # 模型如果自己寫了內容整理就拿掉
+    # 把「內容整理」（詳細筆記）插在「本堂重點」後面
+    content = '## 內容整理\n\n' + '\n\n'.join(detail) + '\n\n'
+    mm = re.search(r'^##\s*名詞解釋', overview, flags=re.M)
+    notes = overview[:mm.start()] + content + overview[mm.start():] if mm else overview + '\n\n' + content
+    write(os.path.join(d, '筆記.md'), notes.strip() + '\n')
+    try: os.remove(os.path.join(d, '_詳細筆記.md'))
+    except OSError: pass
+
+# ---------- 4. 提問（RAG：BM25 從逐字稿／筆記找出相關片段，再請 Gemma 根據片段回答） ----------
+# 中文用「單字＋相鄰兩字」當詞，英文用整個單字，不需要另外裝斷詞或向量模型
+def tokens(s):
+    s = s.lower(); out = re.findall(r'[a-z][a-z0-9+#.]*|\d+', s)
+    for run in re.findall(r'[㐀-鿿]+', s):
+        out += list(run) + [run[i:i + 2] for i in range(len(run) - 1)]
+    return out
+
+def passages(lid):
+    """把一堂課切成約 350 字的片段（前後重疊一行），每段記住開始時間；筆記也按小節切進來。"""
+    d = os.path.join(LECT, lid); name = meta_of(lid)['name'] or lid[:10]
+    src = read(os.path.join(d, '逐字稿_標點.txt')) or read(os.path.join(d, '逐字稿.txt'))
+    lines = [l for l in src.splitlines() if LINE_RX.match(l)]; out, i = [], 0
+    while i < len(lines):
+        j, n = i, 0
+        while j < len(lines) and (n < 350 or j == i): n += len(lines[j]); j += 1
+        seg = lines[i:j]
+        out.append({'lid': lid, 'name': name, 't': seg[0][1:9], 'kind': '逐字稿', 'text': '\n'.join(seg)})   # 保留每行時間，模型才能標出精確出處
+        i = j - 1 if j - i > 1 and j < len(lines) else j
+    for sec in re.split(r'\n(?=##\s)', read(os.path.join(d, '筆記.md'))):
+        if sec.strip():
+            mm = re.search(r'[（(](\d{2}:\d{2}:\d{2})', sec)
+            out.append({'lid': lid, 'name': name, 't': mm[1] if mm else '', 'kind': '筆記', 'text': sec.strip()[:900]})
+    return out
+
+def retrieve(question, lids, k=6):
+    docs = [p for lid in lids for p in passages(lid)]
+    if not docs: return []
+    toks = [tokens(p['text']) for p in docs]; N = len(docs); avg = sum(map(len, toks)) / N or 1
+    df = {}
+    for t in toks:
+        for w in set(t): df[w] = df.get(w, 0) + 1
+    q = set(tokens(question)); scored = []
+    for p, t in zip(docs, toks):
+        tf = {}
+        for w in t:
+            if w in q: tf[w] = tf.get(w, 0) + 1
+        s = 0.0
+        for w, f in tf.items():
+            idf = math.log(1 + (N - df[w] + 0.5) / (df[w] + 0.5))
+            weight = 0.4 if len(w) == 1 and '㐀' <= w <= '鿿' else 1.0     # 單一個中文字權重低一點
+            s += weight * idf * f * 2.2 / (f + 1.2 * (0.25 + 0.75 * len(t) / avg))
+        if s > 0: scored.append((s, p))
+    scored.sort(key=lambda x: -x[0])
+    return [dict(p, score=round(s, 2)) for s, p in scored[:k]]
+
+ASK_SYS = ('你是助教，根據「課堂片段」回答學生的問題，用繁體中文，簡潔清楚，不要用 LaTeX。\n'
+           '規則：1. 只根據課堂片段回答；片段裡沒有提到就說「這幾堂課的逐字稿裡沒有提到」，可以再補充一般知識，但要明確標示「（一般知識，非上課內容）」。'
+           '2. 每個重點後面標出處，格式是（課名 時:分:秒），時間用片段裡那句話開頭的 [時:分:秒]，例如（資料結構 00:12:30）。'
+           '3. 逐字稿是語音辨識的，可能有同音錯字，請依上下文理解。')
+
+def qa_path(lid): return os.path.join(LECT, lid, '提問.json')
+
+# ---------- 即時錄音（後端用 ffmpeg 收音，停頓時把那段送 whisper-server，文字邊錄邊寫進逐字稿.txt） ----------
+SERVER = os.path.join(WHISPER_DIR, 'whisper-server.exe')
+ASR_PORT, RATE, FRAME = 18383, 16000, 480            # 30 ms 一個 frame
+MIN_SEG, MAX_SEG, PAUSE = 4.0, 20.0, 0.6
+HALLU = re.compile(r'^(謝謝(大家)?(觀看|收看|收聽)|請不吝點贊|訂閱|字幕|多謝|thank you|thanks for watching)', re.I)
+LIVE = {'sess': None}
+
+def mic_device():
+    r = subprocess.run([FFMPEG, '-hide_banner', '-list_devices', 'true', '-f', 'dshow', '-i', 'dummy'], capture_output=True)
+    for l in r.stderr.decode('utf-8', 'replace').splitlines():
+        mm = re.search(r'"([^"]+)" \(audio\)', l)
+        if mm: return mm[1]
+    raise RuntimeError('找不到麥克風')
+
+class Live:
+    def __init__(self, name, keywords):
+        self.lid = datetime.datetime.now().strftime('%Y-%m-%d_%H%M%S') + ('_' + name if name else '')
+        self.dir = os.path.join(LECT, self.lid); os.makedirs(self.dir)
+        save_meta(self.lid, {'name': name, 'keywords': keywords, 'source': '即時錄音'})
+        self.t0, self.level, self.lines, self.pending = time.time(), 0.0, [], 0
+        set_job(self.lid, stage='即時錄音', progress=0, message='啟動中…', error='', done=False)
+        self.srv = subprocess.Popen([SERVER, '-m', arg(MODEL), '-l', 'zh', '-t', THREADS, '--port', str(ASR_PORT), '-nt', '-sns',
+                                     '--vad', '-vm', arg(VAD_MODEL)] + (['--prompt', keywords] if keywords else []),
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=ROOT)
+        for _ in range(120):
+            try: urllib.request.urlopen(f'http://127.0.0.1:{ASR_PORT}/', timeout=1); break
+            except Exception: time.sleep(0.5)
+        else:
+            self.srv.kill(); raise RuntimeError('辨識伺服器沒有啟動')
+        # 錄音存成 fragmented m4a：就算程式意外結束，已錄的部分也能播放
+        src = ['-re', '-i', os.environ['LIVE_TEST_FILE']] if os.environ.get('LIVE_TEST_FILE') else ['-f', 'dshow', '-i', 'audio=' + mic_device()]   # 測試用：拿音檔當麥克風
+        self.ff = subprocess.Popen([FFMPEG, '-hide_banner', '-loglevel', 'error', '-y'] + src + [
+                                    '-ac', '1', '-c:a', 'aac', '-b:a', '64k', '-movflags', '+frag_keyframe+empty_moov', os.path.join(self.dir, '錄音.m4a'),
+                                    '-ac', '1', '-ar', str(RATE), '-f', 's16le', '-'], stdout=subprocess.PIPE, stdin=subprocess.PIPE)
+        self.jobs = queue.Queue()
+        self.tw = threading.Thread(target=self.transcriber, daemon=True); self.tw.start()
+        self.tr = threading.Thread(target=self.reader, daemon=True); self.tr.start()
+
+    def post(self, pcm):
+        import io, wave
+        buf = io.BytesIO()
+        with wave.open(buf, 'wb') as w: w.setnchannels(1); w.setsampwidth(2); w.setframerate(RATE); w.writeframes(pcm)
+        b = '----live' + str(time.time_ns())
+        body = (f'--{b}\r\nContent-Disposition: form-data; name="file"; filename="seg.wav"\r\nContent-Type: audio/wav\r\n\r\n').encode() + buf.getvalue() + \
+               (f'\r\n--{b}\r\nContent-Disposition: form-data; name="response_format"\r\n\r\njson\r\n--{b}--\r\n').encode()
+        req = urllib.request.Request(f'http://127.0.0.1:{ASR_PORT}/inference', body, {'Content-Type': f'multipart/form-data; boundary={b}'})
+        return json.load(urllib.request.urlopen(req, timeout=120)).get('text', '').strip()
+
+    def transcriber(self):
+        while True:
+            item = self.jobs.get()
+            if item is None: return
+            start, pcm = item
+            try: text = re.sub(r'\s+', ' ', self.post(pcm)).strip()
+            except Exception as e: text = f'（這段辨識失敗：{e}）'
+            self.pending -= 1
+            if text and not HALLU.match(text):
+                self.lines.append(f'[{hms(start)}] {text}')
+                write(os.path.join(self.dir, '逐字稿.txt'), '\n'.join(self.lines) + '\n')
+
+    def reader(self):
+        from array import array
+        seg, seg_start, silent, noise, pos, voiced = bytearray(), 0.0, 0, 300.0, 0, 0
+        while True:
+            chunk = self.ff.stdout.read(FRAME * 2)
+            if len(chunk) < FRAME * 2: break
+            a = array('h', chunk); rms = (sum(x * x for x in a) / len(a)) ** 0.5
+            self.level = self.level * 0.8 + min(1.0, rms / 3000) * 0.2
+            pos += FRAME
+            speech = rms > max(noise * 2.5, 150)
+            if not speech: noise = noise * 0.995 + rms * 0.005
+            if not seg: seg_start = (pos - FRAME) / RATE
+            seg += chunk; silent = 0 if speech else silent + 1; voiced += speech
+            dur = len(seg) / 2 / RATE
+            if (dur >= MIN_SEG and silent * FRAME / RATE >= PAUSE) or dur >= MAX_SEG:
+                if voiced * FRAME / RATE >= 0.5: self.pending += 1; self.jobs.put((seg_start, bytes(seg)))
+                seg, silent, voiced = bytearray(), 0, 0
+            if pos % (RATE // 2) < FRAME:
+                set_job(self.lid, message=f'已錄 {hms(pos / RATE)}' + (f'，{self.pending} 段辨識中' if self.pending else ''))
+        if len(seg) / 2 / RATE > 1 and voiced: self.pending += 1; self.jobs.put((seg_start, bytes(seg)))
+        self.recorded = pos / RATE
+
+    def stop(self, then_notes):
+        set_job(self.lid, message='停止錄音，等最後幾段辨識完…')
+        try: self.ff.stdin.write(b'q'); self.ff.stdin.flush()
+        except Exception: pass
+        try: self.ff.wait(timeout=15)
+        except Exception: self.ff.kill()
+        self.tr.join(timeout=30); self.jobs.put(None); self.tw.join(timeout=300)
+        self.srv.terminate()
+        m = meta_of(self.lid); m['duration'] = getattr(self, 'recorded', time.time() - self.t0); save_meta(self.lid, m)
+        LIVE['sess'] = None
+        if then_notes and self.lines: enqueue(self.lid, ['punct', 'notes'])
+        else: set_job(self.lid, stage='完成', progress=100, message='', done=True)
+
+# ---------- HTTP ----------
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+
+    def send(self, code, body, ctype='application/json; charset=utf-8', extra=None):
+        if isinstance(body, (dict, list)): body = json.dumps(body, ensure_ascii=False)
+        if isinstance(body, str): body = body.encode('utf-8')
+        self.send_response(code); self.send_header('Content-Type', ctype); self.send_header('Content-Length', str(len(body)))
+        for k, v in (extra or {}).items(): self.send_header(k, v)
+        self.end_headers(); self.wfile.write(body)
+
+    def do_GET(self):
+        u = urllib.parse.urlparse(self.path); path = urllib.parse.unquote(u.path)
+        if path in ('/', '/index.html'):
+            return self.send(200, read(os.path.join(ROOT, 'lecture.html')), 'text/html; charset=utf-8')
+        if path == '/api/lectures':
+            out = []
+            for lid in sorted(os.listdir(LECT), reverse=True):
+                d = os.path.join(LECT, lid)
+                if not os.path.isdir(d): continue
+                m = meta_of(lid)
+                out.append({'id': lid, 'name': m['name'], 'duration': m.get('duration'),
+                            'has': {k: os.path.exists(os.path.join(d, f)) for k, f in [('raw', '逐字稿.txt'), ('punct', '逐字稿_標點.txt'), ('notes', '筆記.md')]},
+                            'job': JOBS.get(lid)})
+            return self.send(200, out)
+        if path == '/api/config':
+            return self.send(200, {'llm': LLM_MODE != 'none', 'llm_mode': LLM_MODE})
+        if path == '/api/live':
+            s = LIVE['sess']
+            return self.send(200, {'active': bool(s), 'id': s and s.lid, 'elapsed': s and time.time() - s.t0, 'level': s and round(s.level, 3)})
+        if path.startswith('/api/lecture/'):
+            lid = safe_id(path.split('/', 3)[3])
+            if not lid: return self.send(404, {'error': '找不到'})
+            d = os.path.join(LECT, lid); m = meta_of(lid)
+            return self.send(200, {'id': lid, 'name': m['name'], 'keywords': m['keywords'], 'duration': m.get('duration'), 'audio': audio_of(lid),
+                                   'raw': read(os.path.join(d, '逐字稿.txt')), 'punct': read(os.path.join(d, '逐字稿_標點.txt')),
+                                   'notes': read(os.path.join(d, '筆記.md')), 'job': JOBS.get(lid),
+                                   'qa': json.loads(read(qa_path(lid), '[]') or '[]')})
+        if path.startswith('/media/'):
+            lid = safe_id(path.split('/', 2)[2]); f = lid and audio_of(lid)
+            if not f: return self.send(404, b'', 'text/plain')
+            return self.send_file(os.path.join(LECT, lid, f))
+        self.send(404, {'error': 'not found'})
+
+    def send_file(self, fp):
+        size = os.path.getsize(fp); ctype = mimetypes.guess_type(fp)[0] or 'application/octet-stream'
+        if fp.lower().endswith('.m4a'): ctype = 'audio/mp4'
+        rng = self.headers.get('Range'); start, end = 0, size - 1
+        if rng and (mm := re.match(r'bytes=(\d*)-(\d*)', rng)):
+            if mm[1]: start = int(mm[1])
+            if mm[2]: end = min(int(mm[2]), size - 1)
+            elif not mm[1]: start = max(0, size - int(mm[2] or 0))
+        self.send_response(206 if rng else 200)
+        self.send_header('Content-Type', ctype); self.send_header('Accept-Ranges', 'bytes')
+        self.send_header('Content-Length', str(end - start + 1))
+        if rng: self.send_header('Content-Range', f'bytes {start}-{end}/{size}')
+        self.end_headers()
+        with open(fp, 'rb') as f:
+            f.seek(start); left = end - start + 1
+            try:
+                while left > 0:
+                    b = f.read(min(1 << 20, left))
+                    if not b: break
+                    self.wfile.write(b); left -= len(b)
+            except (ConnectionError, OSError): pass
+
+    def do_POST(self):
+        u = urllib.parse.urlparse(self.path); path = urllib.parse.unquote(u.path); q = dict(urllib.parse.parse_qsl(u.query))
+        if path == '/api/upload':
+            # 音檔直接放在 body，檔名、課名、關鍵字放在 query string
+            fname = os.path.basename(q.get('filename', 'audio.m4a')); ext = os.path.splitext(fname)[1].lower()
+            if ext not in AUDIO_EXT: return self.send(400, {'error': f'不支援的格式 {ext}'})
+            name = re.sub(r'[\\/:*?"<>|]', '', q.get('name', '')).strip()[:40]
+            lid = datetime.datetime.now().strftime('%Y-%m-%d_%H%M%S') + ('_' + name if name else '')
+            d = os.path.join(LECT, lid); os.makedirs(d)
+            n = int(self.headers.get('Content-Length', 0))
+            with open(os.path.join(d, '錄音' + ext), 'wb') as f:
+                while n > 0:
+                    b = self.rfile.read(min(1 << 20, n))
+                    if not b: break
+                    f.write(b); n -= len(b)
+            save_meta(lid, {'name': name, 'keywords': q.get('keywords', ''), 'source': fname})
+            enqueue(lid, ['asr', 'punct', 'notes'])
+            return self.send(200, {'id': lid})
+        if path.startswith('/api/ask/'):
+            lid = safe_id(path.split('/', 3)[3])
+            if not lid: return self.send(404, {'error': '找不到'})
+            req = json.loads(self.rfile.read(int(self.headers.get('Content-Length', 0))) or b'{}')
+            question = (req.get('q') or '').strip(); scope_all = bool(req.get('all'))
+            if not question: return self.send(400, {'error': '請輸入問題'})
+            history = json.loads(read(qa_path(lid), '[]') or '[]')
+            lids = [x for x in sorted(os.listdir(LECT)) if os.path.isdir(os.path.join(LECT, x))] if scope_all else [lid]
+            # 追問時把上一題也拿來檢索，「那它的缺點呢？」才找得到東西
+            hits = retrieve(question + ' ' + (history[-1]['q'] if history else ''), lids)
+            ctx = '\n\n'.join(f'[{i + 1}]（{h["name"]} {h["t"] or "筆記"}，{h["kind"]}）\n{h["text"]}' for i, h in enumerate(hits)) or '（沒有找到相關片段）'
+            msgs = [{'role': 'system', 'content': ASK_SYS}]
+            for h in history[-2:]: msgs += [{'role': 'user', 'content': h['q']}, {'role': 'assistant', 'content': h['a']}]
+            msgs.append({'role': 'user', 'content': f'課堂片段：\n{ctx}\n\n問題：{question}'})
+            # 用 NDJSON 一行一行串流給瀏覽器：先送出處，再一段段送回答
+            self.send_response(200); self.send_header('Content-Type', 'application/x-ndjson; charset=utf-8'); self.end_headers()
+            emit = lambda o: (self.wfile.write((json.dumps(o, ensure_ascii=False) + '\n').encode()), self.wfile.flush())
+            sources = [{k: h[k] for k in ('lid', 'name', 't', 'kind', 'score')} | {'text': re.sub(r'\[\d{2}:\d{2}:\d{2}\]\s*|\n', ' ', h['text']).strip()[:160]} for h in hits]
+            answer = ''
+            try:
+                emit({'sources': sources})
+                body = llm_body(msgs, 1500, 0.3, stream=True)
+                r = urllib.request.urlopen(urllib.request.Request(llm_url() + '/v1/chat/completions', json.dumps(body).encode(),
+                                                                  {'Content-Type': 'application/json'}), timeout=600)
+                for raw in r:
+                    s = raw.decode('utf-8', 'replace').strip()
+                    if not s.startswith('data:') or s == 'data: [DONE]': continue
+                    try: delta = json.loads(s[5:])['choices'][0]['delta'].get('content') or ''
+                    except Exception: continue
+                    if delta: answer += delta; emit({'delta': delta})
+                answer = unlatex(re.sub(r'<think>[\s\S]*?</think>', '', answer)).strip()
+                history.append({'q': question, 'a': answer, 'all': scope_all, 'sources': sources, 'time': datetime.datetime.now().isoformat(timespec='seconds')})
+                write(qa_path(lid), json.dumps(history, ensure_ascii=False, indent=1))
+                emit({'done': True, 'answer': answer})
+            except (ConnectionError, OSError): pass            # 瀏覽器中途關掉
+            except Exception as e:
+                try: emit({'error': str(e)})
+                except Exception: pass
+            return
+        if path.startswith('/api/qa_clear/'):
+            lid = safe_id(path.split('/', 3)[3])
+            if lid and os.path.exists(qa_path(lid)): os.remove(qa_path(lid))
+            return self.send(200, {'ok': True})
+        if path == '/api/live/start':
+            if LIVE['sess']: return self.send(409, {'error': '已經在錄音了'})
+            name = re.sub(r'[\\/:*?"<>|]', '', q.get('name', '')).strip()[:40]
+            try: LIVE['sess'] = Live(name, q.get('keywords', '').strip())
+            except Exception as e:
+                LIVE['sess'] = None
+                for lid, j in JOBS.items():
+                    if j['stage'] == '即時錄音' and not j['done']: set_job(lid, stage='失敗', error=str(e), done=True)
+                return self.send(500, {'error': str(e)})
+            return self.send(200, {'id': LIVE['sess'].lid})
+        if path == '/api/live/stop':
+            s = LIVE['sess']
+            if not s: return self.send(409, {'error': '沒有在錄音'})
+            threading.Thread(target=s.stop, args=(q.get('notes') == '1',), daemon=True).start()
+            return self.send(200, {'id': s.lid})
+        if path.startswith('/api/run/'):
+            lid = safe_id(path.split('/', 3)[3]); step = q.get('step')
+            if not lid or step not in ('asr', 'punct', 'notes', 'all'): return self.send(400, {'error': '參數錯誤'})
+            if JOBS.get(lid) and not JOBS[lid]['done']: return self.send(409, {'error': '這堂課已經在處理中'})
+            if 'keywords' in q: m = meta_of(lid); m['keywords'] = q['keywords']; save_meta(lid, m)
+            enqueue(lid, {'asr': ['asr', 'punct', 'notes'], 'punct': ['punct', 'notes'], 'notes': ['notes'], 'all': ['asr', 'punct', 'notes']}[step])
+            return self.send(200, {'ok': True})
+        if path.startswith('/api/save/'):
+            lid = safe_id(path.split('/', 3)[3]); kind = q.get('kind')
+            fn = {'notes': '筆記.md', 'punct': '逐字稿_標點.txt'}.get(kind)
+            if not lid or not fn: return self.send(400, {'error': '參數錯誤'})
+            body = self.rfile.read(int(self.headers.get('Content-Length', 0))).decode('utf-8')
+            write(os.path.join(LECT, lid, fn), body); return self.send(200, {'ok': True})
+        self.send(404, {'error': 'not found'})
+
+if __name__ == '__main__':
+    threading.Thread(target=worker, daemon=True).start()
+    ThreadingHTTPServer.allow_reuse_address = False      # Windows 上允許重複綁定會讓兩個程式搶同一個埠
+    try: srv = ThreadingHTTPServer(('127.0.0.1', PORT), H)
+    except OSError:
+        print(f'埠 {PORT} 已經被占用：上課筆記可能已經開著了，直接開 http://127.0.0.1:{PORT}/ 即可。', flush=True)
+        if '--no-browser' not in sys.argv:
+            import webbrowser; webbrowser.open(f'http://127.0.0.1:{PORT}/')
+        sys.exit(1)
+    print(f'上課筆記：http://127.0.0.1:{PORT}/  （關掉這個視窗就會停止）', flush=True)
+    if '--no-browser' not in sys.argv:
+        import webbrowser; webbrowser.open(f'http://127.0.0.1:{PORT}/')
+    try: srv.serve_forever()
+    except KeyboardInterrupt: pass
+    finally:
+        if LIVE['sess']: LIVE['sess'].stop(False)        # 關掉程式時把錄音好好收尾
+        if _llm['proc']: _llm['proc'].terminate()

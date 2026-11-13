@@ -1,0 +1,8 @@
+各位同學早安，今天我們要講資料結構裡的 hash table，也就是雜湊表。
+上次我們講到 linked list 的時候有提過，搜尋一個元素的時間複雜度是 O(n)。
+那 hash table 的好處是，平均情況下搜尋、插入、刪除都可以做到 O(1)。
+它的原理是用一個 hash function，把 key 轉換成陣列的 index。
+但是不同的 key 有可能算出同一個 index，這個叫做 collision，碰撞。
+處理碰撞常見的方法有兩種，第一種是 chaining，第二種是 open addressing。
+下週三要交第二次作業，題目是自己實作一個 hash map，記得要寫 unit test。
+期中考是十一月十八號，範圍從 array 一直到今天講的 hash table。
