@@ -1,12 +1,11 @@
 @echo off
 cd /d "%~dp0"
-rem 安裝過 (有 runtime\python) 就用自帶的 Python；沒安裝但這台有 Python 和 GenieX，就直接用 (開發用的電腦) 
+rem 安裝過 (有 runtime\python) 就用自帶的 Python；開發用的電腦用 .venv
 set "PY=runtime\python\python.exe"
 if exist "%PY%" goto check
-set "PY=python"
-where python >nul 2>nul || goto notinstalled
-where geniex >nul 2>nul || goto notinstalled
-goto run
+set "PY=.venv\Scripts\python.exe"
+if exist "%PY%" goto run
+goto notinstalled
 :check
 if not exist "config.json" goto notinstalled
 :run

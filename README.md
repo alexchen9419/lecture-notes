@@ -54,7 +54,9 @@
 
 ## 開發用的電腦
 
-沒有 `config.json` 時，程式會用系統的 Python 和 GenieX，語音辨識和 AI 模型都走 NPU，Breeze 的檔案則在 `cpu\Release`、`models`。環境變數可以臨時調整：
+先建虛擬環境：`python -m venv .venv`，再執行 `.venv\Scripts\pip install -r requirements.txt`。上課筆記.bat 沒找到 runtime 時會改用 `.venv`。
+
+沒有 `config.json` 時，程式會用 GenieX，語音辨識和 AI 模型都走 NPU，Breeze 的檔案則在 `cpu\Release`、`models`。環境變數可以臨時調整：
 
 | 環境變數 | 用途 |
 |---|---|

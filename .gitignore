@@ -14,3 +14,4 @@ test/mic3s.wav
 test/lecture_raw.wav
 test/err_*.txt
 config.json
+.venv/
