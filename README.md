@@ -2,17 +2,25 @@
 
 把上課錄音變成逐字稿，再整理成詳細筆記，還可以對課堂內容提問。全部在自己的電腦上跑，錄音和筆記不會上傳到網路。
 
+語音辨識用 TEA-ASR-1.1（台灣華語、中英夾雜），有 GenieX 的 Snapdragon 電腦跑在 NPU 上，其他電腦用 llama.cpp。
+
+[English](README.en.md) ｜ [下載最新版](../../releases/latest)
+
+![筆記畫面](docs/screenshot-notes.png)
+
 - **匯入音檔**（m4a、mp3、wav、影片檔都可以）：自動轉逐字稿、整理筆記
 - **即時錄音**：邊錄邊出逐字稿，錄音檔也一起存下來
 - **筆記**：本堂重點、詳細內容整理、名詞解釋、作業／考試／重要日期、待確認
 - **提問**：問課堂內容，回答會附出處時間，點一下就能聽那一段
 - **功耗**：Snapdragon 電腦會顯示即時功耗（整機／CPU／NPU／GPU），並記錄每個步驟用了多少電
 
+![提問畫面](docs/screenshot-ask.png)
+
 ## 安裝
 
 需要 Windows 10／11，x64（Intel、AMD）或 ARM64（Snapdragon）都可以。建議 16 GB 記憶體，8 GB 請選輕量的 AI 模型。硬碟需要約 8 GB。
 
-1. 下載這個專案：按 GitHub 頁面上的 **Code → Download ZIP** 解壓縮，或用 `git clone`。路徑可以有中文。
+1. 下載這個專案：到 [Releases](../../releases/latest) 下載 zip 解壓縮（或按 **Code → Download ZIP**、用 `git clone`）。路徑可以有中文。
 2. 點兩下 **安裝.bat**，照畫面選擇：
    - **語音辨識**：
      1. TEA-ASR-1.1（推薦）：台灣華語、中英夾雜最準，自己會加標點。有裝 GenieX 的 Snapdragon 電腦會跑在 NPU 上，其他電腦用 llama.cpp 跑，有顯示卡就用 GPU。
@@ -70,7 +78,11 @@
 - TEA-ASR-1.1（JacobLinCool，MIT；基於 Qwen3-ASR，Apache 2.0），GGUF 由 mradermacher 轉換
 - Breeze-ASR-25（聯發科 MediaTek Research，Apache 2.0；ggml 格式由社群轉換）
 - Silero VAD（MIT）
-- Gemma 4（Google，Gemma 使用條款）；E4B 選項是社群的 SDFT Heretic RP 微調版
+- Gemma 4（Google，Gemma 使用條款），GGUF 由 unsloth 轉換
 - FFmpeg（GPL 版本，BtbN 編譯）
 - OpenCC（opencc-python-reimplemented，Apache 2.0）
 - Python（PSF License）
+
+## 授權
+
+MIT，詳見 [LICENSE](LICENSE)。各個模型與第三方程式依各自的授權條款。

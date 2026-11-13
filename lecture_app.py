@@ -27,7 +27,7 @@ PORT = int(os.environ.get('LECTURE_PORT') or CFG.get('port') or 18484)
 # AI 模型：geniex（Snapdragon NPU）｜llama-server（可攜版自帶）｜openai（Ollama、LM Studio 等已經在跑的伺服器）｜none（只做逐字稿）
 LLM_CFG = CFG.get('llm') or {'mode': 'geniex'}
 LLM_MODE = LLM_CFG.get('mode', 'geniex')
-LLM_MODEL = LLM_CFG.get('model') or ('mradermacher/gemma-4-E4B-it-SDFT_Heretic_RP-i1-GGUF:Q4_0' if LLM_MODE == 'geniex' else '')
+LLM_MODEL = LLM_CFG.get('model') or ('unsloth/gemma-4-E4B-it-GGUF:Q4_0' if LLM_MODE == 'geniex' else '')
 GENIEX_PORTS = [18181, 18282]           # 先用使用者自己的伺服器；沒開才自己開 18282
 # 語音辨識：geniex = TEA-ASR-1.1 跑在 Snapdragon NPU（GenieX）｜llama-server = TEA-ASR-1.1 用 llama.cpp 跑（CPU／GPU，任何電腦）
 #           whisper = Breeze-ASR-25（whisper.cpp，CPU）

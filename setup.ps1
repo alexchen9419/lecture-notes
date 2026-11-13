@@ -138,7 +138,7 @@ if ($asrChoice -eq '2') {
 
 # ---------- 4. AI 模型（整理筆記、提問；Breeze 還要加標點） ----------
 Say "`n[4/4] AI 模型（整理筆記、提問用）" 'Cyan'
-Say '  1. Gemma 4 E4B（推薦；約 5.2 GB，建議 16 GB 記憶體）'
+Say '  1. Gemma 4 E4B（推薦；約 4.8 GB，建議 16 GB 記憶體）'
 Say '  2. Gemma 4 E2B（輕量；約 3 GB，8 GB 記憶體也能用，筆記品質差一點）'
 Say '  3. 用電腦上已經裝好的 Ollama 或 LM Studio'
 if ($hasGeniex) { Say '  4. 用 GenieX（這台有裝，Snapdragon NPU 最省電）' }
@@ -152,8 +152,8 @@ switch ($choice) {
     { $_ -in '1', '2' } {
         $lDir = Get-Llama
         if ($_ -eq '1') {
-            $gguf = "$MD\gemma-4-E4B-it-SDFT_Heretic_RP.i1-Q4_0.gguf"
-            Get-File 'https://huggingface.co/mradermacher/gemma-4-E4B-it-SDFT_Heretic_RP-i1-GGUF/resolve/main/gemma-4-E4B-it-SDFT_Heretic_RP.i1-Q4_0.gguf' $gguf
+            $gguf = "$MD\gemma-4-E4B-it-Q4_0.gguf"
+            Get-File 'https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q4_0.gguf' $gguf
         } else {
             $gguf = "$MD\gemma-4-E2B-it-Q4_0.gguf"
             Get-File 'https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF/resolve/main/gemma-4-E2B-it-Q4_0.gguf' $gguf
@@ -172,8 +172,9 @@ switch ($choice) {
         $llm = @{ mode = 'openai'; url = $url; model = $m }
     }
     '4' {
-        $m = Read-Host '  GenieX 模型 id（Enter = mradermacher/gemma-4-E4B-it-SDFT_Heretic_RP-i1-GGUF:Q4_0）'
-        $llm = @{ mode = 'geniex'; model = $(if ($m) { $m } else { 'mradermacher/gemma-4-E4B-it-SDFT_Heretic_RP-i1-GGUF:Q4_0' }) }
+        Say '  （模型要先用 geniex pull 下載，例如：geniex pull unsloth/gemma-4-E4B-it-GGUF）' 'DarkGray'
+        $m = Read-Host '  GenieX 模型 id（Enter = unsloth/gemma-4-E4B-it-GGUF:Q4_0）'
+        $llm = @{ mode = 'geniex'; model = $(if ($m) { $m } else { 'unsloth/gemma-4-E4B-it-GGUF:Q4_0' }) }
     }
     default { $llm = @{ mode = 'none' } }
 }

@@ -443,7 +443,11 @@ setInterval(async () => {
     else $('#job').innerHTML = jobHtml(nd.job);
   }
 }, 2000);
-loadList();
+// 網址可以指定要開哪堂課、哪個分頁：#id=<課程資料夾>&tab=notes|punct|raw|ask
+loadList().then(() => {
+  const h = new URLSearchParams(location.hash.slice(1));
+  if (h.get('id')) open(h.get('id')).then(() => { if (h.get('tab')) { tab = h.get('tab'); render(); } });
+});
 </script>
 </body>
 </html>

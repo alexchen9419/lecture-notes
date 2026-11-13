@@ -1,0 +1,82 @@
+# Lecture Notes
+
+**Record a lecture, get a transcript, detailed notes and a Q&A assistant that cites timestamps, all running offline on your own Windows PC.**
+
+The speech recognizer runs on the **Snapdragon NPU** when GenieX is installed, and on llama.cpp (CPU or GPU) everywhere else. It is built for Taiwanese Mandarin lectures with heavy Chinese–English code-switching.
+
+[繁體中文說明](README.md)
+
+![Notes view](docs/screenshot-notes.png)
+
+## Features
+
+- **Import audio or video** (m4a, mp3, wav, mp4…), or **record live**: the transcript appears while you record.
+- **Speech recognition with [TEA-ASR-1.1](https://huggingface.co/JacobLinCool/TEA-ASR-1.1)**, a Qwen3-ASR fine-tune for Taiwanese Mandarin. It outputs Traditional Chinese with punctuation, keeps English terms intact, and takes course keywords as hotwords.
+- **Detailed notes** written by a local LLM (Gemma 4 by default):
+  - key points
+  - per-topic sections
+  - glossary table
+  - homework, exam and deadline list
+  - "please verify" list
+
+  Every bullet links back to its timestamp in the recording.
+- **Ask questions** about one lecture or all of them. BM25 retrieval finds the passages, and the answer cites the course and time, so one click plays that moment.
+- **Power meter**: on Snapdragon PCs the sidebar shows live system, CPU, NPU and GPU power from the Windows Energy Meter, and each step logs the Wh it used.
+- **Private**: audio, transcripts and notes never leave your computer.
+
+![Q&A view](docs/screenshot-ask.png)
+
+## Benchmarks
+
+Measured on a 58-second mixed Chinese–English test lecture on a Snapdragon X2 Elite laptop:
+
+| Speech recognition | Character error rate | Time |
+|---|---|---|
+| TEA-ASR-1.1 on NPU (GenieX) | 2.4% | ~11 s |
+| TEA-ASR-1.1 via llama.cpp, CPU | 2.4% | ~17 s (incl. server start) |
+| Breeze-ASR-25 via whisper.cpp, CPU | 4.9% | ~18 s |
+
+## Install
+
+Requires Windows 10 or 11 on x64 (Intel or AMD) or ARM64 (Snapdragon). 16 GB RAM is recommended; with 8 GB, pick the small model. It needs about 8 GB of disk space.
+
+1. Get the files: download the [latest release](../../releases/latest), or use **Code → Download ZIP**, or `git clone`.
+2. Double-click **安裝.bat** (Install). It downloads everything into the folder:
+   - portable Python
+   - ffmpeg
+   - llama.cpp
+   - the TEA-ASR model
+   - an LLM of your choice: Gemma 4 E4B or E2B, an existing Ollama or LM Studio, GenieX, or none
+3. Double-click **上課筆記.bat** (Lecture Notes). Your browser opens http://127.0.0.1:18484/.
+
+The installer changes no system settings. To uninstall, delete the folder.
+
+### Using the NPU
+
+Install Qualcomm's GenieX CLI first. The installer detects it and offers to run TEA-ASR on the NPU. The audio encoder runs on the CPU and the decoder runs on the Hexagon NPU.
+
+## How it works
+
+```
+audio ─ ffmpeg 16 kHz ─ pause-based segmentation (≤ 28 s) ─ TEA-ASR (GenieX NPU / llama-server)
+      ─ transcript with timestamps ─ LLM: per-topic detailed notes ─ overview, glossary, exams
+      ─ BM25 over transcript + notes ─ LLM answer with (course hh:mm:ss) citations
+```
+
+Notes for anyone running Qwen3-ASR or TEA-ASR GGUFs through llama.cpp or GenieX:
+
+- Always send a `system` message, even an empty one. Without it the model emits `language Chinese` and stops.
+- The mradermacher GGUF emits stray private-use characters (U+E000–U+F8FF) after some words. Strip them.
+- On GenieX, start the server with `--vit-compute CPU`. Putting the audio encoder on HTP crashes the server.
+
+## Credits
+
+- [TEA-ASR-1.1](https://huggingface.co/JacobLinCool/TEA-ASR-1.1) by JacobLinCool (MIT), based on Qwen3-ASR (Apache 2.0). The GGUF was converted by mradermacher.
+- [llama.cpp](https://github.com/ggml-org/llama.cpp) and [whisper.cpp](https://github.com/ggml-org/whisper.cpp) (MIT).
+- [Breeze-ASR-25](https://huggingface.co/MediaTek-Research/Breeze-ASR-25) by MediaTek Research (Apache 2.0).
+- Gemma 4 by Google (Gemma Terms of Use).
+- FFmpeg (GPL build by BtbN) and OpenCC.
+
+## License
+
+MIT
