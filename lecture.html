@@ -94,6 +94,12 @@ textarea.edit { width: 100%; min-height: 60vh; padding: 12px; border: 1px solid 
 .pw .rails { display: flex; gap: 10px; flex-wrap: wrap; }
 .pw .npu { color: var(--accent); font-weight: 600; }
 .energy { font-size: 12px; color: var(--muted); margin-top: 6px; }
+.spk { display: inline-block; font-size: 12px; line-height: 18px; padding: 0 7px; border-radius: 9px; margin-right: 6px; cursor: pointer;
+       background: color-mix(in srgb, var(--warn) 14%, transparent); color: var(--warn); white-space: nowrap; }
+.spk.s0 { background: var(--accent-soft); color: var(--accent); }
+.spk:hover { outline: 1px solid currentColor; }
+.spkbar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; font-size: 13px; color: var(--muted); margin-bottom: 14px; }
+.spkbar .btn { font-size: 12px; padding: 2px 10px; }
 .energy span + span::before { content: '｜'; margin: 0 4px; color: var(--line); }
 @media (max-width: 760px) {
   .app { grid-template-columns: 1fr; height: auto; }
@@ -147,6 +153,7 @@ fetch('/api/config').then(r => r.json()).then(c => {
     $('#lnotesLabel').textContent = '結束後自動整理筆記';
     document.querySelector('#drop p').textContent = `匯入音檔（m4a、mp3、wav…），會自動${c.asr === 'geniex' ? '用 NPU ' : ''}轉逐字稿（含標點）、整理筆記。也可以把檔案拖到這裡。`;
   }
+  if (c.diarize) $('#lnotesLabel').textContent = $('#lnotesLabel').textContent.replace('結束後自動', '結束後自動分辨講者、');
   if (c.power) { $('#pw').hidden = false; pollPower(); setInterval(pollPower, 1000); }
 }).catch(() => {});
 const W = v => v == null ? '–' : v < 10 ? v.toFixed(2) : v.toFixed(1);
@@ -156,11 +163,11 @@ async function pollPower() {
   const w = p.w;
   $('#pw').innerHTML = `<div>功耗 <b>${W(w.system)}</b> W（整機）</div><div class="rails"><span>CPU ${W(w.cpu)} W</span><span class="npu">NPU ${W(w.npu)} W</span><span>GPU ${W(w.gpu)} W</span><span>記憶體 ${W(w.memory)} W</span></div>`;
 }
-const STEP = { asr: '語音辨識', punct: '加標點', notes: '整理筆記', live: '即時錄音' };
+const STEP = { asr: '語音辨識', punct: '加標點', spk: '分辨講者', notes: '整理筆記', live: '即時錄音' };
 const fmtSec = s => s >= 3600 ? `${Math.floor(s / 3600)} 時 ${Math.floor(s % 3600 / 60)} 分` : s >= 60 ? `${Math.floor(s / 60)} 分 ${s % 60} 秒` : `${s} 秒`;
 const Wh = v => v >= 1 ? v.toFixed(2) + ' Wh' : Math.round(v * 1000) + ' mWh';
 function energyHtml(e) {
-  const ks = ['live', 'asr', 'punct', 'notes'].filter(k => e && e[k]);
+  const ks = ['live', 'asr', 'punct', 'spk', 'notes'].filter(k => e && e[k]);
   if (!ks.length) return '';
   const tot = ks.reduce((a, k) => a + e[k].wh.system, 0);
   return `<div class="energy" title="整機耗電包含螢幕和背景程式；括號內是 NPU／CPU 各自用的電">耗電：${ks.map(k => `<span>${STEP[k]}${e[k].engine === 'geniex' && (k === 'asr' || k === 'live') ? '（NPU）' : ''} ${fmtSec(e[k].sec)}，平均 ${e[k].avg_w} W，${Wh(e[k].wh.system)}（NPU ${Wh(e[k].wh.npu)}／CPU ${Wh(e[k].wh.cpu)}）</span>`).join('')}${ks.length > 1 ? `<span>合計 ${Wh(tot)}</span>` : ''}</div>`;
@@ -265,11 +272,40 @@ function renderBody() {
     return;
   }
   if (tab === 'notes') body.innerHTML = `<div class="md">${md(text)}</div>`;
-  else body.innerHTML = text.split('\n').filter(Boolean).map(l => {
-    const m = l.match(/^\[(\d\d:\d\d:\d\d)\]\s*(.*)$/);
-    return m ? `<div class="tline" data-t="${toSec(m[1])}"><span class="ts" data-seek="${toSec(m[1])}">${m[1]}</span><span>${esc(m[2])}</span></div>` : `<div class="tline"><span>${esc(l)}</span></div>`;
-  }).join('');
+  else {
+    // 講者：換人講話時才顯示名字標籤；點名字可以改名
+    const names = (d.speakers || []).map(s => s.name);
+    const cls = n => 's' + Math.max(0, names.indexOf(n));
+    let prev = null;
+    const lines = text.split('\n').filter(Boolean).map(l => {
+      const m = l.match(/^\[(\d\d:\d\d:\d\d)\]\s*(?:【([^】]{1,12})】)?(.*)$/);
+      if (!m) return `<div class="tline"><span>${esc(l)}</span></div>`;
+      const chip = m[2] && m[2] !== prev ? `<span class="spk ${cls(m[2])}" data-spk="${esc(m[2])}">${esc(m[2])}</span>` : '';
+      if (m[2]) prev = m[2];
+      return `<div class="tline" data-t="${toSec(m[1])}"><span class="ts" data-seek="${toSec(m[1])}">${m[1]}</span><span>${chip}${esc(m[3])}</span></div>`;
+    }).join('');
+    const busy = d.job && !d.job.done;
+    const bar = names.length ? `<div class="spkbar">講者：${d.speakers.map(s => `<span class="spk ${cls(s.name)}" data-spk="${esc(s.name)}" title="點一下改名">${esc(s.name)} ${fmtSec(s.sec)}</span>`).join('')}
+        <span>（電腦自動分辨，點名字可以改名）</span>${appCfg.diarize && !busy ? '<button class="btn" id="respk">重新分辨</button>' : ''}</div>`
+      : appCfg.diarize && !busy && !isLive(d) && d.audio ? '<div class="spkbar"><button class="btn" id="respk">分辨講者</button><span>（目前只聽到一個人，或還沒分辨過）</span></div>' : '';
+    body.innerHTML = bar + lines;
+    body.querySelectorAll('[data-spk]').forEach(el => el.onclick = () => renameSpk(el.dataset.spk));
+    if ($('#respk')) $('#respk').onclick = respk;
+  }
   body.querySelectorAll('[data-seek]').forEach(el => el.onclick = () => seek(+el.dataset.seek));
+}
+async function renameSpk(old) {
+  const n = prompt(`把「${old}」改成：`, old);
+  if (!n || n.trim() === old) return;
+  const r = await fetch('/api/speaker/' + encodeURIComponent(cur), { method: 'POST', body: JSON.stringify({ old, new: n.trim() }) });
+  if (!r.ok) alert((await r.json()).error || '失敗');
+  open(cur, true);
+}
+async function respk() {
+  if (!confirm('重新分辨講者？之後會重新整理筆記（改過的講者名字會保留）。')) return;
+  const r = await fetch(`/api/run/${encodeURIComponent(cur)}?step=spk`, { method: 'POST' });
+  if (!r.ok) alert((await r.json()).error || '失敗');
+  open(cur, true);
 }
 function seek(t) { const p = $('#player'); if (!p) return; p.currentTime = t; p.play(); }
 // 跳到別堂課的某個時間

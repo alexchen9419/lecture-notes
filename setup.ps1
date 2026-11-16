@@ -12,6 +12,7 @@ $WHISPER_TAG = 'b5454'
 $LLAMA_TAG = 'b11976'
 $TEA_REPO = 'https://huggingface.co/mradermacher/TEA-ASR-1.1-GGUF/resolve/main'
 $TEA_GGUF = 'TEA-ASR-1.1.Q8_0.gguf'; $TEA_MMPROJ = 'TEA-ASR-1.1.mmproj-f16.gguf'
+$SHERPA_VER = '2.0.1'
 
 function Say($msg, $color = 'White') { Write-Host $msg -ForegroundColor $color }
 
@@ -126,13 +127,46 @@ if ($asrChoice -eq '2') {
         }
         $mf = Join-Path $gxDir 'geniex.json'
         if (-not (Test-Path $mf)) { [IO.File]::WriteAllText($mf, ($manifest | ConvertTo-Json -Depth 5 -Compress), (New-Object Text.UTF8Encoding $false)) }
+        # NPU 偶爾會有一段辨識不出來，用 CPU 的 llama.cpp 補（約 30 MB）
         $asr = @{ engine = 'geniex'; model = 'mradermacher/TEA-ASR-1.1-GGUF:Q8_0' }
+        try { $asr.fallback_server = (Rel (Join-Path (Get-Llama) 'llama-server.exe')) } catch { Say '  llama.cpp 下載失敗，略過 CPU 補辨識' 'Yellow' }
     } else {
         $lDir = Get-Llama
         Get-File "$TEA_REPO/$TEA_GGUF" "$MD\$TEA_GGUF"
         Get-File "$TEA_REPO/$TEA_MMPROJ" "$MD\$TEA_MMPROJ"
         $asr = @{ engine = 'llama-server'; server = (Rel (Join-Path $lDir 'llama-server.exe')); gguf = "models\$TEA_GGUF"; mmproj = "models\$TEA_MMPROJ"
                   port = 18487; gpu_layers = $gpuLayers }
+    }
+}
+
+# ---------- 3b. 分辨講者（sherpa-onnx，CPU；約 60 MB） ----------
+$diar = Ask "`n  要分辨講者嗎？（逐字稿會標出老師、學生，約 60 MB）(Y/n)" 'SETUP_DIAR'
+$useDiar = ($diar -ne 'n' -and $diar -ne 'N')
+if ($useDiar) {
+    try {
+        $plat = $(if ($arm) { 'win_arm64' } else { 'win_amd64' })
+        if (-not (Test-Path "$RT\pylib\sherpa_onnx\lib")) {
+            foreach ($pkg in @('sherpa-onnx', 'sherpa-onnx-core')) {
+                $urls = (Invoke-RestMethod "https://pypi.org/pypi/$pkg/$SHERPA_VER/json" -TimeoutSec 20).urls
+                $whl = $urls | Where-Object { $_.filename -like "*-$plat.whl" -and ($_.filename -like '*-cp312-*' -or $_.filename -like '*-py3-none-*') } | Select-Object -First 1
+                if (-not $whl) { throw "找不到 $pkg 的 $plat 版本" }
+                $wz = Join-Path $DL "$pkg-$SHERPA_VER-$plat.zip"          # wheel 就是 zip，裡面已經有編好的 DLL
+                Get-File $whl.url $wz
+                Expand-Archive -Path $wz -DestinationPath "$RT\pylib" -Force
+            }
+            Remove-Item "$RT\pylib\sherpa_onnx_core-*.data" -Recurse -Force -ErrorAction SilentlyContinue   # 同樣的 DLL 已經在 sherpa_onnx\lib
+        }
+        $dd = "$MD\diar"; New-Item -ItemType Directory -Force $dd | Out-Null
+        if (-not (Test-Path "$dd\sherpa-onnx-pyannote-segmentation-3-0\model.onnx")) {
+            $sz = Join-Path $DL 'pyannote-seg.tar.bz2'
+            Get-File 'https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2' $sz
+            & "$env:SystemRoot\System32\tar.exe" -xjf $sz -C $dd          # Windows 10 以後內建 tar（bsdtar），會解 .tar.bz2
+            if ($LASTEXITCODE -ne 0) { throw '解壓縮 pyannote 模型失敗' }
+        }
+        Get-File 'https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx' "$dd\3dspeaker_eres2net_base_zh.onnx"
+    } catch {
+        Say "  分辨講者的元件下載失敗，先略過（之後可以重新執行安裝）：$_" 'Yellow'
+        $useDiar = $false
     }
 }
 
@@ -187,6 +221,7 @@ $cfg = [ordered]@{
     port         = 18484
     asr          = $asr
     llm          = $llm
+    diarize      = $useDiar
 }
 foreach ($k in $cfgWhisper.Keys) { $cfg[$k] = $cfgWhisper[$k] }
 [IO.File]::WriteAllText((Join-Path $Root 'config.json'), ($cfg | ConvertTo-Json -Depth 4), (New-Object Text.UTF8Encoding $false))
@@ -202,6 +237,10 @@ foreach ($t in $tests) {
     & $t[1] $t[2] 2>$null | Out-Null
     if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 1) { Say "  $($t[0]) 無法執行（可能缺少 Visual C++ 執行階段），請安裝：$vc" 'Yellow' } else { Say "  $($t[0]) OK" 'Green' }
 }
+if ($useDiar) {
+    & "$RT\python\python.exe" -c "import sys; sys.path.insert(0, sys.argv[1]); import sherpa_onnx" "$RT\pylib" 2>$null
+    if ($LASTEXITCODE -ne 0) { Say "  分辨講者 無法執行（可能缺少 Visual C++ 執行階段），請安裝：$vc" 'Yellow' } else { Say '  分辨講者 OK' 'Green' }
+}
 $ErrorActionPreference = 'Stop'
 
 $ans = Ask "`n要在桌面建立「上課筆記」捷徑嗎？(Y/n)" 'SETUP_SHORTCUT'
@@ -212,6 +251,6 @@ if ($ans -ne 'n' -and $ans -ne 'N') {
 }
 
 $ans = Ask "`n刪除下載的安裝檔（zip）來省空間嗎？模型不會刪 (Y/n)" 'SETUP_CLEAN'
-if ($ans -ne 'n' -and $ans -ne 'N') { Get-ChildItem $DL -Filter *.zip | Remove-Item -Force }
+if ($ans -ne 'n' -and $ans -ne 'N') { Get-ChildItem $DL -Include *.zip, *.bz2 -Recurse | Remove-Item -Force }
 
 Say "`n安裝完成！點兩下「上課筆記.bat」（或桌面捷徑）就能開始用。`n" 'Green'

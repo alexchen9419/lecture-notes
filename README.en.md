@@ -21,6 +21,7 @@ The speech recognizer runs on the **Snapdragon NPU** when GenieX is installed, a
 
   Every bullet links back to its timestamp in the recording.
 - **Ask questions** about one lecture or all of them. BM25 retrieval finds the passages, and the answer cites the course and time, so one click plays that moment.
+- **Speaker diarization**: transcript lines are tagged 【老師】 (teacher) or 【學生1】 (student 1) and so on. Student questions and the teacher's answers become a "課堂問答" (class Q&A) section in the notes. Click a name to rename that speaker. Runs on the CPU with sherpa-onnx.
 - **Power meter**: on Snapdragon PCs the sidebar shows live system, CPU, NPU and GPU power from the Windows Energy Meter, and each step logs the Wh it used.
 - **Private**: audio, transcripts and notes never leave your computer.
 
@@ -46,6 +47,7 @@ Requires Windows 10 or 11 on x64 (Intel or AMD) or ARM64 (Snapdragon). 16 GB RAM
    - ffmpeg
    - llama.cpp
    - the TEA-ASR model
+   - optional speaker diarization (sherpa-onnx, about 60 MB)
    - an LLM of your choice: Gemma 4 E4B or E2B, an existing Ollama or LM Studio, GenieX, or none
 3. Double-click **上課筆記.bat** (Lecture Notes). Your browser opens http://127.0.0.1:18484/.
 
@@ -66,6 +68,7 @@ audio ─ ffmpeg 16 kHz ─ pause-based segmentation (≤ 28 s) ─ TEA-ASR (Gen
 Notes for anyone running Qwen3-ASR or TEA-ASR GGUFs through llama.cpp or GenieX:
 
 - Always send a `system` message, even an empty one. Without it the model emits `language Chinese` and stops.
+- Even with a system message, some segments still return only `language Chinese`, on both CPU and NPU. Retrying with an assistant prefill of `language Chinese<asr_text>` fixes it, on llama-server and on GenieX.
 - The mradermacher GGUF emits stray private-use characters (U+E000–U+F8FF) after some words. Strip them.
 - On GenieX, start the server with `--vit-compute CPU`. Putting the audio encoder on HTP crashes the server.
 
@@ -76,6 +79,7 @@ Notes for anyone running Qwen3-ASR or TEA-ASR GGUFs through llama.cpp or GenieX:
 - [Breeze-ASR-25](https://huggingface.co/MediaTek-Research/Breeze-ASR-25) by MediaTek Research (Apache 2.0).
 - Gemma 4 by Google (Gemma Terms of Use).
 - FFmpeg (GPL build by BtbN) and OpenCC.
+- [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) (Apache 2.0), pyannote segmentation 3.0 (MIT) and 3D-Speaker ERes2Net (Apache 2.0) for speaker diarization.
 
 ## License
 

@@ -10,6 +10,7 @@
 
 - **匯入音檔**（m4a、mp3、wav、影片檔都可以）：自動轉逐字稿、整理筆記
 - **即時錄音**：邊錄邊出逐字稿，錄音檔也一起存下來
+- **分辨講者**：逐字稿標出【老師】【學生1】…，學生的提問和老師的回答會整理成筆記裡的「課堂問答」；名字可以點一下改
 - **筆記**：本堂重點、詳細內容整理、名詞解釋、作業／考試／重要日期、待確認
 - **提問**：問課堂內容，回答會附出處時間，點一下就能聽那一段
 - **功耗**：Snapdragon 電腦會顯示即時功耗（整機／CPU／NPU／GPU），並記錄每個步驟用了多少電
@@ -25,6 +26,7 @@
    - **語音辨識**：
      1. TEA-ASR-1.1（推薦）：台灣華語、中英夾雜最準，自己會加標點。有裝 GenieX 的 Snapdragon 電腦會跑在 NPU 上，其他電腦用 llama.cpp 跑，有顯示卡就用 GPU。
      2. Breeze-ASR-25：whisper 系的模型。
+   - **分辨講者**（約 60 MB，在 CPU 上跑）：要不要標出誰在講話。
    - **AI 模型**（整理筆記、提問）：Gemma 4 E4B（推薦）、Gemma 4 E2B（輕量）、已經裝好的 Ollama 或 LM Studio、GenieX，或不用 AI、只做逐字稿。
 3. 安裝完會問要不要在桌面建立捷徑。
 
@@ -52,6 +54,16 @@
 
 1 小時的課：語音辨識大約 10～20 分鐘，整理筆記 20～30 分鐘。電腦越快越短，處理時記得插電。
 
+## 分辨講者
+
+講最多話的人會標成「老師」，其他人依出現順序標成「學生1」「學生2」…。點逐字稿上方的名字可以改名，改完逐字稿會跟著改。1 小時的課大約多花 3～6 分鐘。
+
+- 老師別麥克風、或錄音的位置離講台近：分得最準。
+- 在教室後面用筆電收音：學生的聲音太小、太遠，可能整段被併給老師，或同一個人被拆成兩個。
+- 兩個人同時講話時，那一段只會標成其中一個人。
+
+不想分辨講者：重新執行 安裝.bat 選 n，或在 `config.json` 加上 `"diarize": false`。
+
 ## 注意
 
 - 逐字稿是語音辨識的，專有名詞和同音字可能會錯，筆記和回答也可能跟著錯。重要的地方請點時間戳回去聽。
@@ -62,7 +74,7 @@
 
 ## 開發用的電腦
 
-先建虛擬環境：`python -m venv .venv`，再執行 `.venv\Scripts\pip install -r requirements.txt`。上課筆記.bat 沒找到 runtime 時會改用 `.venv`。
+先建虛擬環境：`python -m venv .venv`，再執行 `.venv\Scripts\pip install -r requirements.txt`。分辨講者的模型放在 `models\diar`（pyannote segmentation 3.0 和 3D-Speaker ERes2Net，下載網址見 setup.ps1）。上課筆記.bat 沒找到 runtime 時會改用 `.venv`。
 
 沒有 `config.json` 時，程式會用 GenieX，語音辨識和 AI 模型都走 NPU，Breeze 的檔案則在 `cpu\Release`、`models`。環境變數可以臨時調整：
 
@@ -71,6 +83,7 @@
 | `LECTURE_ASR=whisper` | 臨時改回 Breeze |
 | `LECTURE_DIR` | 換資料夾，測試時用 |
 | `LECTURE_PORT` | 換埠，測試時用 |
+| `LECTURE_DIARIZE=0` | 暫時不分辨講者 |
 
 ## 使用的開源專案與模型
 
@@ -78,6 +91,7 @@
 - TEA-ASR-1.1（JacobLinCool，MIT；基於 Qwen3-ASR，Apache 2.0），GGUF 由 mradermacher 轉換
 - Breeze-ASR-25（聯發科 MediaTek Research，Apache 2.0；ggml 格式由社群轉換）
 - Silero VAD（MIT）
+- sherpa-onnx（k2-fsa，Apache 2.0）、pyannote segmentation 3.0（MIT）、3D-Speaker ERes2Net（阿里巴巴達摩院，Apache 2.0）：分辨講者
 - Gemma 4（Google，Gemma 使用條款），GGUF 由 unsloth 轉換
 - FFmpeg（GPL 版本，BtbN 編譯）
 - OpenCC（opencc-python-reimplemented，Apache 2.0）

@@ -39,6 +39,7 @@ ASR_GX_PORT = int(ASR_CFG.get('port') or 18282)   # 固定用自己開的伺服�
 TEA = ASR_ENGINE in ('geniex', 'llama-server')
 ASR_TAG = {'geniex': '（NPU）', 'llama-server': '（TEA）'}.get(ASR_ENGINE, '')
 PIPELINE = ['asr', 'notes'] if TEA else ['asr', 'punct', 'notes']      # TEA-ASR 自己會加標點，不用再跑「加標點」
+                                                                        # 有分辨講者時，筆記前面再插一步 spk（見 pipeline()）
 AUDIO_EXT = {'.m4a', '.mp3', '.wav', '.ogg', '.opus', '.webm', '.flac', '.aac', '.mp4', '.mkv', '.mov', '.wma'}
 LINE_RX = re.compile(r'^\[(\d{2}):(\d{2}):(\d{2})\]\s*(.*)$')
 os.makedirs(LECT, exist_ok=True)
@@ -131,7 +132,7 @@ class PowerMeter:
         return {'sec': round(sec), 'avg_w': round(wh['system'] * 3600 / sec, 1) if sec > 0 else 0, 'wh': {k: round(v, 3) for k, v in wh.items()}}
 
 POWER = PowerMeter()
-STEP_NAME = {'asr': '語音辨識', 'punct': '加標點', 'notes': '整理筆記', 'live': '即時錄音'}
+STEP_NAME = {'asr': '語音辨識', 'punct': '加標點', 'spk': '分辨講者', 'notes': '整理筆記', 'live': '即時錄音'}
 
 def record_energy(lid, step, mark):
     if not POWER.ok: return
@@ -159,10 +160,13 @@ def worker():
             if 'asr' in steps:                # 即時錄音時 CPU 已經在跑辨識，匯入的音檔等錄完再處理
                 while LIVE['sess']:
                     set_job(lid, stage='排隊中', message='等即時錄音結束'); time.sleep(2)
-            if LLM_MODE == 'none': steps = [s for s in steps if s == 'asr']      # 沒有 AI 模型就只做逐字稿
+            if LLM_MODE == 'none': steps = [s for s in steps if s in ('asr', 'spk')]      # 沒有 AI 模型就只做逐字稿
             for s in steps:
                 mark = POWER.mark()
-                {'asr': run_asr_tea if TEA else run_asr, 'punct': run_punct, 'notes': run_notes}[s](lid)
+                try: {'asr': run_asr_tea if TEA else run_asr, 'punct': run_punct, 'spk': run_spk, 'notes': run_notes}[s](lid)
+                except Exception as e:
+                    if s != 'spk': raise
+                    traceback.print_exc(); print('分辨講者失敗，略過：', e, flush=True); continue     # 分不出講者也不影響筆記
                 record_energy(lid, s, mark)
             set_job(lid, stage='完成', progress=100, done=True)
         except Exception as e:
@@ -229,8 +233,8 @@ PUA = re.compile('[-]')     # 這個 GGUF 會在某些字後面多吐一�
 def asr_clean(t):
     t = PUA.sub('', t or '').replace('\r', ' ').replace('\n', ' ')
     # 前綴「language Chinese<asr_text>」；有時候標籤是中文（language中文），沒聲音時是 language None
-    t = re.sub(r'^\s*language\s*(?:[A-Za-z]+|中文|英文|粵語|日文|韓文)?\s*', '', t).replace('<asr_text>', '')
-    return to_trad(re.sub(r'\s+', ' ', t).strip())
+    t = re.sub(r'^\s*language\s*(?:[A-Za-z]+|中文|英文|英語|粵語|日文|韓文)?\s*', '', t).replace('<asr_text>', '')
+    return to_trad(re.sub(r'\s+', ' ', t).strip().lstrip('。，,. '))
 
 def wav_bytes(pcm):
     import io, wave
@@ -238,26 +242,54 @@ def wav_bytes(pcm):
     with wave.open(buf, 'wb') as w: w.setnchannels(1); w.setsampwidth(2); w.setframerate(RATE); w.writeframes(pcm)
     return buf.getvalue()
 
-def tea_asr(pcm, context=''):
-    """一段 16 kHz 單聲道 PCM（最好 ≤ 30 秒）→ 文字。context 放關鍵字當熱詞（system 一定要有，不然模型只會吐出 language Chinese 就停）"""
+def _tea_call(url, pcm, context, prefill=False):
     import base64
-    body = {'model': ASR_MODEL_ID, 'temperature': 0, 'top_k': 1, 'max_tokens': 600, 'stream': False,
-            'messages': [{'role': 'system', 'content': context or ''},
-                         {'role': 'user', 'content': [{'type': 'input_audio', 'input_audio': {'data': base64.b64encode(wav_bytes(pcm)).decode(), 'format': 'wav'}}]}]}
+    msgs = [{'role': 'system', 'content': context or ''},
+            {'role': 'user', 'content': [{'type': 'input_audio', 'input_audio': {'data': base64.b64encode(wav_bytes(pcm)).decode(), 'format': 'wav'}}]}]
+    if prefill: msgs.append({'role': 'assistant', 'content': 'language Chinese<asr_text>'})
+    body = {'model': ASR_MODEL_ID, 'temperature': 0, 'top_k': 1, 'max_tokens': 600, 'stream': False, 'messages': msgs}
+    req = urllib.request.Request(url + '/v1/chat/completions', json.dumps(body).encode(), {'Content-Type': 'application/json'})
+    return json.load(urllib.request.urlopen(req, timeout=300))['choices'][0]['message'].get('content') or ''
+
+LANG_ONLY = re.compile(r'^\s*language\s*(?!None)\S')
+
+def _quietest(pcm):
+    """中間三分之一裡最安靜的地方（切成兩半用），回傳 byte 位置"""
+    n = len(pcm) // 2; best, at = None, n // 2
+    for i in range(n // 3, 2 * n // 3 - FRAME, FRAME):
+        v = rms16(pcm[i * 2:(i + FRAME) * 2])
+        if best is None or v < best: best, at = v, i
+    return at * 2
+
+def tea_asr(pcm, context='', _depth=0):
+    """一段 16 kHz 單聲道 PCM（最好 ≤ 30 秒）→ 文字。context 放關鍵字當熱詞（system 一定要有，不然模型只會吐出 language Chinese 就停）"""
     for attempt in range(3):          # NPU 偶爾會掛（休眠、過熱後），伺服器死掉就重開再試
         try:
-            url = asr_server()
-            req = urllib.request.Request(url + '/v1/chat/completions', json.dumps(body).encode(), {'Content-Type': 'application/json'})
-            r = json.load(urllib.request.urlopen(req, timeout=300))
-            return asr_clean(r['choices'][0]['message'].get('content'))
+            url = asr_server(); raw = _tea_call(url, pcm, context); break
         except (urllib.error.URLError, ConnectionError, TimeoutError, OSError) as e:
             if attempt == 2: raise RuntimeError(f'語音辨識失敗：{e}')
             time.sleep(3)
+    text = asr_clean(raw)
+    if text or not LANG_ONLY.match(raw): return text
+    # 有些段落只吐出「language Chinese」就結束（CPU、NPU 都會）。在 llama-server 上幫它把 <asr_text> 接上去再跑一次就好；
+    # GenieX 不支援這樣接（會回 500），所以改用 CPU 的 llama-server 補這一段
+    try:
+        cpu = url if ASR_ENGINE == 'llama-server' else asr_cpu_server()
+        if cpu:
+            text = asr_clean(_tea_call(cpu, pcm, context, prefill=True))
+            if text: return text
+    except Exception as e:
+        print('CPU 補辨識失敗：', e, flush=True)
+    if _depth < 1 and len(pcm) > RATE * 2 * 4:      # 還是不行：從中間最安靜的地方切兩半各自辨識
+        cut = _quietest(pcm)
+        return ' '.join(t for t in (tea_asr(pcm[:cut], context, _depth + 1), tea_asr(pcm[cut:], context, _depth + 1)) if t)
+    return ''
 
 class Segmenter:
-    """用音量切段：講到 min_seg 秒以上、遇到 pause 秒的停頓就切；講太久沒停頓，18 秒後只要短短停一下就切，max_seg 秒強制切。"""
-    def __init__(self, min_seg, max_seg, pause):
-        self.min_seg, self.max_seg, self.pause = min_seg, max_seg, pause
+    """用音量切段：講到 min_seg 秒以上、遇到 pause 秒的停頓就切；講太久沒停頓，18 秒後只要短短停一下就切，max_seg 秒強制切。
+    force 是換人講話的時間點（秒），到了就切，一段才不會混到兩個人。"""
+    def __init__(self, min_seg, max_seg, pause, force=()):
+        self.min_seg, self.max_seg, self.pause, self.force = min_seg, max_seg, pause, list(force)
         self.seg, self.start, self.silent, self.voiced, self.noise, self.pos, self.level = bytearray(), 0.0, 0, 0, 300.0, 0, 0.0
 
     def feed(self, chunk):
@@ -269,28 +301,174 @@ class Segmenter:
         self.pos += len(chunk) // 2
         self.seg += chunk; self.silent = 0 if speech else self.silent + 1; self.voiced += speech
         dur = len(self.seg) / 2 / RATE; quiet = self.silent * FRAME / RATE
+        if self.force and self.pos / RATE >= self.force[0]:
+            while self.force and self.pos / RATE >= self.force[0]: self.force.pop(0)
+            if dur >= 0.8: return self.cut(keep=True)     # 分辨講者確定這段有人講話，聲音小也不要丟
         if (dur >= self.min_seg and quiet >= (self.pause if dur < 18 else 0.2)) or dur >= self.max_seg:
             return self.cut()
 
-    def cut(self):
-        out = (self.start, bytes(self.seg)) if self.voiced * FRAME / RATE >= 0.5 else None
+    def cut(self, keep=False):
+        out = (self.start, bytes(self.seg)) if keep or self.voiced * FRAME / RATE >= 0.5 else None
         self.seg, self.silent, self.voiced = bytearray(), 0, 0
         return out
 
-def run_asr_tea(lid):
-    import wave
-    d = os.path.join(LECT, lid); m = meta_of(lid); src = audio_of(lid)
+# ---------- 分辨講者（sherpa-onnx：pyannote 切出誰在講話，3D-Speaker 算聲紋，再把聲音像的歸成同一人；都在 CPU） ----------
+DIAR_DIR = cfg_path('diar_dir', os.path.join('models', 'diar'))
+DIAR_SEG = os.path.join(DIAR_DIR, 'sherpa-onnx-pyannote-segmentation-3-0', 'model.onnx')
+DIAR_EMB = os.path.join(DIAR_DIR, '3dspeaker_eres2net_base_zh.onnx')
+SPK_FILE = '講者.json'          # {'turns': [[開始, 結束, 編號]...], 'names': {編號: 名字}}
+SPK_RX = re.compile(r'^(\[\d{2}:\d{2}:\d{2}\]\s*)【([^】]{1,12})】\s*')
+
+def diar_available():
+    if CFG.get('diarize') is False or os.environ.get('LECTURE_DIARIZE') == '0': return False
+    if not (os.path.exists(DIAR_SEG) and os.path.exists(DIAR_EMB)): return False
+    try: import sherpa_onnx; return True
+    except Exception: return False
+DIAR = diar_available()
+
+def diarize(wav, lid=None):
+    """16 kHz 單聲道 wav → [[開始, 結束, 講者編號]]，編號 0 是講最多的人（通常是老師）"""
+    import wave, sherpa_onnx as so
+    from array import array
+    sd = so.OfflineSpeakerDiarization(so.OfflineSpeakerDiarizationConfig(
+        segmentation=so.OfflineSpeakerSegmentationModelConfig(
+            pyannote=so.OfflineSpeakerSegmentationPyannoteModelConfig(model=DIAR_SEG), num_threads=4),
+        embedding=so.SpeakerEmbeddingExtractorConfig(model=DIAR_EMB, num_threads=4),
+        clustering=so.FastClusteringConfig(num_clusters=-1, threshold=0.5),      # 不指定人數，聲紋距離超過門檻就算另一個人
+        min_duration_on=0.3, min_duration_off=0.5))
+    with wave.open(wav, 'rb') as w: pcm = array('h', w.readframes(w.getnframes()))
+    x = array('f', (v / 32768 for v in pcm)); del pcm
+    t0 = time.time()
+    def cb(n, total):
+        if lid and total:
+            el = time.time() - t0; eta = el / n * (total - n)
+            set_job(lid, stage='分辨講者', progress=int(n / total * 100), message=f'約剩 {int(eta // 60)} 分 {int(eta % 60)} 秒')
+        return 0
+    turns = [[round(s.start, 2), round(s.end, 2), s.speaker] for s in sd.process(x, callback=cb).sort_by_start_time()]
+    # 只講不到 1.5 秒的「講者」多半是咳嗽、雜音，併給前一個人
+    total = {}
+    for s, e, k in turns: total[k] = total.get(k, 0) + e - s
+    tiny = {k for k, v in total.items() if v < 1.5}
+    for i, t in enumerate(turns):
+        if t[2] in tiny: t[2] = next((u[2] for u in reversed(turns[:i]) if u[2] not in tiny), next((u[2] for u in turns if u[2] not in tiny), t[2]))
+    # 重新編號：講最多的是 0，其他依第一次出現的順序
+    total = {}
+    for s, e, k in turns: total[k] = total.get(k, 0) + e - s
+    main = max(total, key=total.get) if total else 0
+    order = [main] + [k for k in dict.fromkeys(t[2] for t in turns) if k != main]
+    remap = {k: i for i, k in enumerate(order)}
+    for t in turns: t[2] = remap[t[2]]
+    return turns
+
+def speaker_cuts(turns):
+    """換人講話的時間點：兩個人中間有空檔就切在空檔中間"""
+    cuts = []
+    for a, b in zip(turns, turns[1:]):
+        if a[2] != b[2]: cuts.append((a[1] + b[0]) / 2 if b[0] > a[1] else b[0])
+    return cuts
+
+def spk_info(lid):
+    try: return json.loads(read(os.path.join(LECT, lid, SPK_FILE)) or 'null')
+    except ValueError: return None
+
+def spk_default_name(k): return '老師' if k == 0 else f'學生{k}'
+
+def label_lines(lines, info, dur=None):
+    """每行逐字稿標上講者：從這行開始到下一行開始，和誰講話的時間重疊最多就是誰。只有一個人時不標。"""
+    turns, names = info['turns'], info.get('names') or {}
+    plain = [SPK_RX.sub(r'\1', l) for l in lines]
+    if len({t[2] for t in turns}) < 2: return plain
+    stamps = [(i, hms_sec(m)) for i, l in enumerate(plain) if (m := LINE_RX.match(l))]
+    out, prev = list(plain), None
+    for j, (i, s) in enumerate(stamps):
+        e = stamps[j + 1][1] if j + 1 < len(stamps) else (dur or s + 30)
+        ov = {}
+        for ts, te, k in turns:
+            o = min(e, te) - max(s, ts)
+            if o > 0: ov[k] = ov.get(k, 0) + o
+        k = max(ov, key=ov.get) if ov else prev
+        if k is None: continue
+        prev = k
+        m = LINE_RX.match(plain[i])
+        out[i] = f'[{m[1]}:{m[2]}:{m[3]}] 【{names.get(str(k)) or spk_default_name(k)}】{m[4]}'
+    return out
+
+def hms_sec(m): return int(m[1]) * 3600 + int(m[2]) * 60 + int(m[3])
+
+def to_wav16(lid):
+    d = os.path.join(LECT, lid); src = audio_of(lid)
     if not src: raise RuntimeError('找不到音檔')
-    set_job(lid, stage='轉檔', progress=0, message='把音檔轉成 16 kHz')
     wav = os.path.join(ROOT, 'tmp', 'asr_16k.wav'); os.makedirs(os.path.dirname(wav), exist_ok=True)
     subprocess.run([FFMPEG, '-hide_banner', '-loglevel', 'error', '-y', '-i', os.path.join(d, src), '-ac', '1', '-ar', str(RATE), wav], check=True)
+    return wav
+
+def ensure_turns(lid, wav=None):
+    """講者分段存在 講者.json，重做語音辨識時不用再算一次"""
+    info = spk_info(lid)
+    if info and 'turns' in info: return info
+    own = wav is None
+    if own: set_job(lid, stage='分辨講者', progress=0, message='把音檔轉成 16 kHz'); wav = to_wav16(lid)
+    set_job(lid, stage='分辨講者', progress=0, message='分析聲紋…')
+    info = {'turns': diarize(wav, lid), 'names': (info or {}).get('names') or {}}
+    write(os.path.join(LECT, lid, SPK_FILE), json.dumps(info, ensure_ascii=False))
+    if own:
+        try: os.remove(wav)
+        except OSError: pass
+    return info
+
+def run_spk(lid):
+    """幫逐字稿標上講者（匯入時語音辨識前就分好了，這裡只是標；即時錄音、Breeze 在這一步才分）"""
+    d = os.path.join(LECT, lid); info = ensure_turns(lid); dur = meta_of(lid).get('duration')
+    for fn in ('逐字稿.txt', '逐字稿_標點.txt'):
+        p = os.path.join(d, fn)
+        if os.path.exists(p): write(p, '\n'.join(label_lines(read(p).splitlines(), info, dur)) + '\n')
+
+def rename_speaker(lid, old, new):
+    info = spk_info(lid)
+    if not info: raise RuntimeError('這堂課還沒分辨講者')
+    names = info.setdefault('names', {})
+    ks = {t[2] for t in info['turns']}
+    k = next((k for k in ks if (names.get(str(k)) or spk_default_name(k)) == old), None)
+    if k is None: raise RuntimeError(f'找不到講者「{old}」')
+    if any((names.get(str(j)) or spk_default_name(j)) == new for j in ks if j != k): raise RuntimeError(f'已經有講者叫「{new}」')
+    names[str(k)] = new
+    write(os.path.join(LECT, lid, SPK_FILE), json.dumps(info, ensure_ascii=False))
+    d = os.path.join(LECT, lid)
+    for fn in ('逐字稿.txt', '逐字稿_標點.txt'):
+        p = os.path.join(d, fn)
+        if os.path.exists(p): write(p, '\n'.join(SPK_RX.sub(lambda m: f'{m[1]}【{new}】' if m[2] == old else m[0], l) for l in read(p).splitlines()) + '\n')
+
+def pipeline(steps, force=False):
+    """有分辨講者時，在整理筆記前插一步 spk（標講者）"""
+    if not (DIAR or force) or 'spk' in steps: return list(steps)
+    i = steps.index('notes') if 'notes' in steps else len(steps)
+    return list(steps[:i]) + ['spk'] + list(steps[i:])
+
+def speakers_of(lid):
+    """[{name, sec}]，講最多的排前面"""
+    info = spk_info(lid)
+    if not info or 'turns' not in info: return []
+    names, tot = info.get('names') or {}, {}
+    for s, e, k in info['turns']: tot[k] = tot.get(k, 0) + e - s
+    if len(tot) < 2: return []
+    return [{'name': names.get(str(k)) or spk_default_name(k), 'sec': round(v)} for k, v in sorted(tot.items(), key=lambda kv: -kv[1])]
+
+def run_asr_tea(lid):
+    import wave
+    d = os.path.join(LECT, lid); m = meta_of(lid)
+    set_job(lid, stage='轉檔', progress=0, message='把音檔轉成 16 kHz')
+    wav = to_wav16(lid)
+    cuts = []
+    if DIAR:                          # 先分好誰在講話，換人的地方強制切段，一段逐字稿只會有一個人
+        try: cuts = speaker_cuts(ensure_turns(lid, wav)['turns'])
+        except Exception as e: traceback.print_exc(); print('分辨講者失敗，略過：', e, flush=True)
     set_job(lid, stage='語音辨識', progress=0, message='載入語音模型…')
     asr_server()
     out_path = os.path.join(d, '逐字稿.txt'); lines = []; ctx = m['keywords'].strip()
     with wave.open(wav, 'rb') as w:
         dur = w.getnframes() / RATE
         m['duration'] = dur; save_meta(lid, m)
-        seg = Segmenter(15, 28, 0.5); t0 = time.time()     # 匯入的音檔不急，段落長一點上下文比較多（太短時 O(1) 會被聽成「哦一」）
+        seg = Segmenter(15, 28, 0.5, cuts); t0 = time.time()     # 匯入的音檔不急，段落長一點上下文比較多（太短時 O(1) 會被聽成「哦一」）
 
         def do(item):
             start, pcm = item
@@ -310,6 +488,7 @@ def run_asr_tea(lid):
             if item: do(item)
     try: os.remove(wav)
     except OSError: pass
+    stop_cpu_server()
     if not lines: raise RuntimeError('沒有辨識出任何文字（音檔可能沒有人聲）')
     write(os.path.join(d, '逐字稿_標點.txt'), '\n'.join(lines) + '\n')     # TEA 的輸出已經有標點，直接當「逐字稿」
 
@@ -385,6 +564,42 @@ def asr_server():
         start(0)
         return url
 
+# GenieX 有時辨識不出某一段時，用 CPU 的 llama-server 補（同一個模型檔，用到才開，辨識完就關）
+_cpu = {'proc': None, 'lock': threading.Lock()}
+
+def _find_cpu_server():
+    exe = ASR_CFG.get('fallback_server')
+    if exe: return rel(exe) if os.path.exists(rel(exe)) else None
+    for dp, _, fs in os.walk(os.path.join(ROOT, 'runtime', 'llama')):
+        if 'llama-server.exe' in fs: return os.path.join(dp, 'llama-server.exe')
+
+def _tea_files():
+    if ASR_CFG.get('gguf') and ASR_CFG.get('mmproj'): return rel(ASR_CFG['gguf']), rel(ASR_CFG['mmproj'])
+    d = os.path.join(os.environ.get('GENIEX_DATADIR') or os.path.join(os.path.expanduser('~'), '.cache', 'geniex'), 'models', *ASR_MODEL_ID.split(':')[0].split('/'))
+    g = [f for f in (os.listdir(d) if os.path.isdir(d) else []) if f.endswith('.gguf')]
+    mm = next((f for f in g if 'mmproj' in f), None); main = next((f for f in g if 'mmproj' not in f), None)
+    return (os.path.join(d, main), os.path.join(d, mm)) if mm and main else (None, None)
+
+def asr_cpu_server():
+    port = int(ASR_CFG.get('fallback_port') or 18488); url = f'http://127.0.0.1:{port}'
+    with _cpu['lock']:
+        if _cpu['proc'] and _cpu['proc'].poll() is None and _alive(url): return url
+        exe = _find_cpu_server(); gguf, mmproj = _tea_files()
+        if not (exe and gguf): return None
+        print('有一段 NPU 辨識不出來，開 CPU 的 llama-server 補辨識', flush=True)
+        _cpu['proc'] = subprocess.Popen([exe, '-m', gguf, '--mmproj', mmproj, '--host', '127.0.0.1', '--port', str(port), '-c', '4096', '-ngl', '0'],
+                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=ROOT)
+        for _ in range(120):
+            time.sleep(1)
+            if _cpu['proc'].poll() is not None: return None
+            if _alive(url): return url
+        _cpu['proc'].kill(); return None
+
+def stop_cpu_server():
+    with _cpu['lock']:
+        if _cpu['proc'] and _cpu['proc'].poll() is None: _cpu['proc'].terminate()
+        _cpu['proc'] = None
+
 def llm_url():
     if LLM_MODE == 'none': raise RuntimeError('沒有設定 AI 模型（只能做逐字稿）；要加標點、整理筆記或提問，請重新執行 安裝.bat')
     with _llm['lock']:
@@ -442,7 +657,7 @@ def chunks(lines, limit):
     if cur: out.append(cur)
     return out
 
-TOPIC_RX = re.compile(r'^\[\d{2}:\d{2}:\d{2}\]\s*(好[，,。 ]|好了|那接下來|接下來|那我們|我們來|我們再|另外|最後|再來|下面|下一個|OK|okay)', re.I)
+TOPIC_RX = re.compile(r'^\[\d{2}:\d{2}:\d{2}\]\s*(?:【[^】]*】)?(好[，,。 ]|好了|那接下來|接下來|那我們|我們來|我們再|另外|最後|再來|下面|下一個|OK|okay)', re.I)
 
 def topic_chunks(lines, limit):
     """跟 chunks() 一樣切段，但會往回找老師換話題的那一行（「好，」「接下來」…）再切，例子比較不會被切成兩半。"""
@@ -500,7 +715,8 @@ NOTE_PART_SYS = ('你是很會做筆記的學生，要把一段課堂逐字稿�
                  '4. 每個條列最後標時間，例如（00:12:30）。\n'
                  '5. 交代的事項（作業、報告、考試、日期、繳交方式、要預習的章節）也要寫進對應的地方。\n'
                  '6. 只根據逐字稿，不要補充逐字稿沒講的課本知識；可能是語音辨識錯字或聽不懂的地方標「（？）」。\n'
-                 '7. 不要開場白和結語，直接從 ### 開始；不要用課名當標題；不要寫「逐字稿中斷」之類的註記。')
+                 '7. 不要開場白和結語，直接從 ### 開始；不要用課名當標題；不要寫「逐字稿中斷」之類的註記。\n'
+                 '8. 逐字稿的行首可能有【老師】【學生1】這類講者標記（電腦自動分辨，偶爾會標錯）。學生提問和老師的回答，整理在相關主題最後的「**課堂問答**」：「- Q：學生的問題 → A：老師的回答（00:12:30）」；其他內容不用寫是誰講的。')
 NOTE_FINAL_SYS = ('你是很會做筆記的學生。下面是一堂課的詳細筆記，請寫這堂課的「總覽」，繁體中文，Markdown，不要用 LaTeX。\n'
                   '只輸出下面這五個部分，標題文字照抄、不要加括號說明，也不要重寫詳細內容：\n'
                   '# <課名>：<這堂課的主題>\n'
@@ -585,7 +801,8 @@ def retrieve(question, lids, k=6):
 ASK_SYS = ('你是助教，根據「課堂片段」回答學生的問題，用繁體中文，簡潔清楚，不要用 LaTeX。\n'
            '規則：1. 只根據課堂片段回答；片段裡沒有提到就說「這幾堂課的逐字稿裡沒有提到」，可以再補充一般知識，但要明確標示「（一般知識，非上課內容）」。'
            '2. 每個重點後面標出處，格式是（課名 時:分:秒），時間用片段裡那句話開頭的 [時:分:秒]，例如（資料結構 00:12:30）。'
-           '3. 逐字稿是語音辨識的，可能有同音錯字，請依上下文理解。')
+           '3. 逐字稿是語音辨識的，可能有同音錯字，請依上下文理解。'
+           '4. 行首的【老師】【學生1】是電腦自動分辨的講者，偶爾會標錯。')
 
 def qa_path(lid): return os.path.join(LECT, lid, '提問.json')
 
@@ -679,9 +896,11 @@ class Live:
         if self.srv: self.srv.terminate()
         m = meta_of(self.lid); m['duration'] = getattr(self, 'recorded', time.time() - self.t0); save_meta(self.lid, m)
         record_energy(self.lid, 'live', self.mark)
+        stop_cpu_server()
         if TEA and self.lines: write(os.path.join(self.dir, '逐字稿_標點.txt'), '\n'.join(self.lines) + '\n')
         LIVE['sess'] = None
-        if then_notes and self.lines: enqueue(self.lid, ['notes'] if TEA else ['punct', 'notes'])
+        steps = ([] if TEA else ['punct']) + ['notes'] if then_notes else []
+        if self.lines and (steps or DIAR): enqueue(self.lid, pipeline(steps))
         else: set_job(self.lid, stage='完成', progress=100, message='', done=True)
 
 # ---------- HTTP ----------
@@ -710,7 +929,7 @@ class H(BaseHTTPRequestHandler):
                             'job': JOBS.get(lid)})
             return self.send(200, out)
         if path == '/api/config':
-            return self.send(200, {'llm': LLM_MODE != 'none', 'llm_mode': LLM_MODE, 'asr': ASR_ENGINE, 'tea': TEA, 'power': POWER.ok})
+            return self.send(200, {'llm': LLM_MODE != 'none', 'llm_mode': LLM_MODE, 'asr': ASR_ENGINE, 'tea': TEA, 'power': POWER.ok, 'diarize': DIAR})
         if path == '/api/power':
             return self.send(200, {'ok': POWER.ok, 'w': POWER.watts() if POWER.ok else None, 'error': POWER.err})
         if path == '/api/live':
@@ -723,6 +942,7 @@ class H(BaseHTTPRequestHandler):
             return self.send(200, {'id': lid, 'name': m['name'], 'keywords': m['keywords'], 'duration': m.get('duration'), 'audio': audio_of(lid),
                                    'raw': read(os.path.join(d, '逐字稿.txt')), 'punct': read(os.path.join(d, '逐字稿_標點.txt')),
                                    'notes': read(os.path.join(d, '筆記.md')), 'job': JOBS.get(lid), 'energy': m.get('energy') or {},
+                                   'speakers': speakers_of(lid),
                                    'qa': json.loads(read(qa_path(lid), '[]') or '[]')})
         if path.startswith('/media/'):
             lid = safe_id(path.split('/', 2)[2]); f = lid and audio_of(lid)
@@ -768,7 +988,7 @@ class H(BaseHTTPRequestHandler):
                     if not b: break
                     f.write(b); n -= len(b)
             save_meta(lid, {'name': name, 'keywords': q.get('keywords', ''), 'source': fname})
-            enqueue(lid, PIPELINE)
+            enqueue(lid, pipeline(PIPELINE))
             return self.send(200, {'id': lid})
         if path.startswith('/api/ask/'):
             lid = safe_id(path.split('/', 3)[3])
@@ -830,10 +1050,21 @@ class H(BaseHTTPRequestHandler):
             return self.send(200, {'id': s.lid})
         if path.startswith('/api/run/'):
             lid = safe_id(path.split('/', 3)[3]); step = q.get('step')
-            if not lid or step not in ('asr', 'punct', 'notes', 'all'): return self.send(400, {'error': '參數錯誤'})
+            if not lid or step not in ('asr', 'punct', 'spk', 'notes', 'all'): return self.send(400, {'error': '參數錯誤'})
             if JOBS.get(lid) and not JOBS[lid]['done']: return self.send(409, {'error': '這堂課已經在處理中'})
             if 'keywords' in q: m = meta_of(lid); m['keywords'] = q['keywords']; save_meta(lid, m)
-            enqueue(lid, {'asr': PIPELINE, 'punct': ['punct', 'notes'], 'notes': ['notes'], 'all': PIPELINE}[step])
+            if step == 'spk':             # 重新分辨講者：丟掉舊的分段（名字保留），標完再重寫筆記
+                info = spk_info(lid)
+                if info: info.pop('turns', None); write(os.path.join(LECT, lid, SPK_FILE), json.dumps(info, ensure_ascii=False))
+            enqueue(lid, pipeline({'asr': PIPELINE, 'punct': ['punct', 'notes'], 'spk': ['notes'], 'notes': ['notes'], 'all': PIPELINE}[step], force=step == 'spk'))
+            return self.send(200, {'ok': True})
+        if path.startswith('/api/speaker/'):
+            lid = safe_id(path.split('/', 3)[3])
+            req = json.loads(self.rfile.read(int(self.headers.get('Content-Length', 0))) or b'{}')
+            new = re.sub(r'[【】\[\]\s]', '', req.get('new') or '')[:12]
+            if not lid or not new: return self.send(400, {'error': '請輸入名字'})
+            try: rename_speaker(lid, req.get('old') or '', new)
+            except RuntimeError as e: return self.send(400, {'error': str(e)})
             return self.send(200, {'ok': True})
         if path.startswith('/api/save/'):
             lid = safe_id(path.split('/', 3)[3]); kind = q.get('kind')
