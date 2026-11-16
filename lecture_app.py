@@ -75,7 +75,8 @@ def safe_id(lid):
 
 # ---------- 功耗（Windows 的 Energy Meter 計數器，單位 mW；Snapdragon 會分 CPU／GPU／NPU／記憶體…） ----------
 class PowerMeter:
-    RAILS = ('system', 'soc', 'cpu_cluster_0', 'cpu_cluster_1', 'cpu_cluster_2', 'gpu', 'npu', 'memory')
+    RAILS = ('system', 'soc', 'cpu_cluster_0', 'cpu_cluster_1', 'cpu_cluster_2', 'gpu', 'npu', 'memory', 'infra', 'multimedia')
+    # system（整機）＝ soc（晶片）＋ 晶片外（螢幕、SSD、Wi-Fi、電源轉換…）；soc ＝ CPU＋NPU＋GPU＋記憶體＋infra（晶片內部匯流排、快取等）＋multimedia
 
     def __init__(self):
         self.ok, self.now, self.energy, self.err = False, {}, {}, ''      # now：瓦；energy：從程式啟動累積的焦耳
@@ -118,8 +119,12 @@ class PowerMeter:
 
     def watts(self):
         n = self.now
-        return {'system': n.get('system'), 'soc': n.get('soc'), 'npu': n.get('npu'), 'gpu': n.get('gpu'), 'memory': n.get('memory'),
-                'cpu': sum(n.get(f'cpu_cluster_{i}', 0) for i in range(3)) if n else None}
+        if not n: return None
+        soc = n.get('soc'); cpu = sum(n.get(f'cpu_cluster_{i}', 0) for i in range(3))
+        known = cpu + sum(n.get(k, 0) for k in ('npu', 'gpu', 'memory'))
+        return {'system': n.get('system'), 'soc': soc, 'npu': n.get('npu'), 'gpu': n.get('gpu'), 'memory': n.get('memory'), 'cpu': cpu,
+                'soc_other': max(0, soc - known) if soc is not None else None,                  # 晶片內其他（infra、多媒體）
+                'board': max(0, n['system'] - soc) if soc is not None and n.get('system') is not None else None}   # 晶片外
 
     def mark(self): return (time.time(), dict(self.energy))
 
@@ -127,8 +132,8 @@ class PowerMeter:
         """從 mark() 到現在：秒數、整機平均瓦數、各部分用電（Wh）"""
         t0, e0 = mark; sec = time.time() - t0
         d = {r: (self.energy.get(r, 0) - e0.get(r, 0)) / 3600 for r in self.energy}
-        wh = {'system': d.get('system', 0), 'npu': d.get('npu', 0), 'gpu': d.get('gpu', 0),
-              'cpu': sum(d.get(f'cpu_cluster_{i}', 0) for i in range(3))}
+        wh = {'system': d.get('system', 0), 'soc': d.get('soc', 0), 'npu': d.get('npu', 0), 'gpu': d.get('gpu', 0),
+              'cpu': sum(d.get(f'cpu_cluster_{i}', 0) for i in range(3)), 'memory': d.get('memory', 0)}
         return {'sec': round(sec), 'avg_w': round(wh['system'] * 3600 / sec, 1) if sec > 0 else 0, 'wh': {k: round(v, 3) for k, v in wh.items()}}
 
 POWER = PowerMeter()
@@ -230,10 +235,13 @@ except Exception:
 
 PUA = re.compile('[-]')     # 這個 GGUF 會在某些字後面多吐一個私用區字元，直接濾掉
 
+REPEAT = re.compile(r'(.{1,4}?)(?:\s*\1){5,}', re.S)
+
 def asr_clean(t):
     t = PUA.sub('', t or '').replace('\r', ' ').replace('\n', ' ')
     # 前綴「language Chinese<asr_text>」；有時候標籤是中文（language中文），沒聲音時是 language None
     t = re.sub(r'^\s*language\s*(?:[A-Za-z]+|中文|英文|英語|粵語|日文|韓文)?\s*', '', t).replace('<asr_text>', '')
+    t = REPEAT.sub(r'\1', t)          # 偶爾會卡住一直重複同一個字（你你你你…），留一個就好
     return to_trad(re.sub(r'\s+', ' ', t).strip().lstrip('。，,. '))
 
 def wav_bytes(pcm):
@@ -247,7 +255,8 @@ def _tea_call(url, pcm, context, prefill=False):
     msgs = [{'role': 'system', 'content': context or ''},
             {'role': 'user', 'content': [{'type': 'input_audio', 'input_audio': {'data': base64.b64encode(wav_bytes(pcm)).decode(), 'format': 'wav'}}]}]
     if prefill: msgs.append({'role': 'assistant', 'content': 'language Chinese<asr_text>'})
-    body = {'model': ASR_MODEL_ID, 'temperature': 0, 'top_k': 1, 'max_tokens': 600, 'stream': False, 'messages': msgs}
+    sec = len(pcm) / 2 / RATE      # 一秒講不到 10 個字，限制長度，卡住重複時才不會一直吐
+    body = {'model': ASR_MODEL_ID, 'temperature': 0, 'top_k': 1, 'max_tokens': min(600, int(sec * 12) + 40), 'stream': False, 'messages': msgs}
     req = urllib.request.Request(url + '/v1/chat/completions', json.dumps(body).encode(), {'Content-Type': 'application/json'})
     return json.load(urllib.request.urlopen(req, timeout=300))['choices'][0]['message'].get('content') or ''
 
@@ -270,20 +279,22 @@ def tea_asr(pcm, context='', _depth=0):
             if attempt == 2: raise RuntimeError(f'語音辨識失敗：{e}')
             time.sleep(3)
     text = asr_clean(raw)
-    if text or not LANG_ONLY.match(raw): return text
+    stuck = bool(REPEAT.search(PUA.sub('', raw)))        # 卡住一直重複同一個字（你你你你…），後面的內容會不見
+    if (text and not stuck) or (not text and not LANG_ONLY.match(raw)): return text
+    first = text
     # 有些段落只吐出「language Chinese」就結束（CPU、NPU 都會）。在 llama-server 上幫它把 <asr_text> 接上去再跑一次就好；
     # GenieX 不支援這樣接（會回 500），所以改用 CPU 的 llama-server 補這一段
     try:
         cpu = url if ASR_ENGINE == 'llama-server' else asr_cpu_server()
         if cpu:
-            text = asr_clean(_tea_call(cpu, pcm, context, prefill=True))
-            if text: return text
+            raw2 = _tea_call(cpu, pcm, context, prefill=True); text = asr_clean(raw2)
+            if text and not REPEAT.search(PUA.sub('', raw2)): return text
     except Exception as e:
         print('CPU 補辨識失敗：', e, flush=True)
     if _depth < 1 and len(pcm) > RATE * 2 * 4:      # 還是不行：從中間最安靜的地方切兩半各自辨識
         cut = _quietest(pcm)
-        return ' '.join(t for t in (tea_asr(pcm[:cut], context, _depth + 1), tea_asr(pcm[cut:], context, _depth + 1)) if t)
-    return ''
+        return ' '.join(t for t in (tea_asr(pcm[:cut], context, _depth + 1), tea_asr(pcm[cut:], context, _depth + 1)) if t) or first
+    return first
 
 class Segmenter:
     """用音量切段：講到 min_seg 秒以上、遇到 pause 秒的停頓就切；講太久沒停頓，18 秒後只要短短停一下就切，max_seg 秒強制切。
@@ -325,6 +336,9 @@ def diar_available():
     try: import sherpa_onnx; return True
     except Exception: return False
 DIAR = diar_available()
+# 門檻越低分得越細。實際的教室錄音（遠、有回音）用 0.5 會把老師拆成十幾個人，0.8 比較剛好
+DIAR_THR = float(CFG.get('diar_threshold') or 0.8)
+DIAR_MIN_SEC = float(CFG.get('diar_min_sec') or 3)        # 整堂課講不到這麼多秒的「講者」多半是雜音、笑聲，併給前一個人
 
 def diarize(wav, lid=None):
     """16 kHz 單聲道 wav → [[開始, 結束, 講者編號]]，編號 0 是講最多的人（通常是老師）"""
@@ -334,7 +348,7 @@ def diarize(wav, lid=None):
         segmentation=so.OfflineSpeakerSegmentationModelConfig(
             pyannote=so.OfflineSpeakerSegmentationPyannoteModelConfig(model=DIAR_SEG), num_threads=4),
         embedding=so.SpeakerEmbeddingExtractorConfig(model=DIAR_EMB, num_threads=4),
-        clustering=so.FastClusteringConfig(num_clusters=-1, threshold=0.5),      # 不指定人數，聲紋距離超過門檻就算另一個人
+        clustering=so.FastClusteringConfig(num_clusters=-1, threshold=DIAR_THR),   # 不指定人數，聲紋距離超過門檻就算另一個人
         min_duration_on=0.3, min_duration_off=0.5))
     with wave.open(wav, 'rb') as w: pcm = array('h', w.readframes(w.getnframes()))
     x = array('f', (v / 32768 for v in pcm)); del pcm
@@ -345,10 +359,10 @@ def diarize(wav, lid=None):
             set_job(lid, stage='分辨講者', progress=int(n / total * 100), message=f'約剩 {int(eta // 60)} 分 {int(eta % 60)} 秒')
         return 0
     turns = [[round(s.start, 2), round(s.end, 2), s.speaker] for s in sd.process(x, callback=cb).sort_by_start_time()]
-    # 只講不到 1.5 秒的「講者」多半是咳嗽、雜音，併給前一個人
+    # 講太少的「講者」多半是咳嗽、雜音，併給前一個人
     total = {}
     for s, e, k in turns: total[k] = total.get(k, 0) + e - s
-    tiny = {k for k, v in total.items() if v < 1.5}
+    tiny = {k for k, v in total.items() if v < DIAR_MIN_SEC}
     for i, t in enumerate(turns):
         if t[2] in tiny: t[2] = next((u[2] for u in reversed(turns[:i]) if u[2] not in tiny), next((u[2] for u in turns if u[2] not in tiny), t[2]))
     # 重新編號：講最多的是 0，其他依第一次出現的順序
@@ -361,7 +375,8 @@ def diarize(wav, lid=None):
     return turns
 
 def speaker_cuts(turns):
-    """換人講話的時間點：兩個人中間有空檔就切在空檔中間"""
+    """換人講話的時間點：兩個人中間有空檔就切在空檔中間（不到 1 秒的插話不切，段落太短辨識會變差）"""
+    turns = [t for t in turns if t[1] - t[0] >= 1.0]
     cuts = []
     for a, b in zip(turns, turns[1:]):
         if a[2] != b[2]: cuts.append((a[1] + b[0]) / 2 if b[0] > a[1] else b[0])

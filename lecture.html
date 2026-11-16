@@ -161,7 +161,11 @@ async function pollPower() {
   let p; try { p = await (await fetch('/api/power')).json(); } catch { return; }
   if (!p.ok || !p.w) return;
   const w = p.w;
-  $('#pw').innerHTML = `<div>功耗 <b>${W(w.system)}</b> W（整機）</div><div class="rails"><span>CPU ${W(w.cpu)} W</span><span class="npu">NPU ${W(w.npu)} W</span><span>GPU ${W(w.gpu)} W</span><span>記憶體 ${W(w.memory)} W</span></div>`;
+  // 整機 ＝ 晶片（CPU＋NPU＋GPU＋記憶體＋晶片內其他）＋ 晶片外（螢幕、SSD、Wi-Fi、電源轉換…）
+  $('#pw').innerHTML = `<div>功耗 <b>${W(w.system)}</b> W（整機）</div>` + (w.soc == null
+    ? `<div class="rails"><span>CPU ${W(w.cpu)} W</span><span class="npu">NPU ${W(w.npu)} W</span><span>GPU ${W(w.gpu)} W</span><span>記憶體 ${W(w.memory)} W</span></div>`
+    : `<div class="rails" title="晶片（SoC）的電">晶片 ${W(w.soc)} W：<span>CPU ${W(w.cpu)}</span><span class="npu">NPU ${W(w.npu)}</span><span>GPU ${W(w.gpu)}</span><span>記憶體 ${W(w.memory)}</span><span title="晶片內部的匯流排、快取、多媒體等">其他 ${W(w.soc_other)}</span></div>
+       <div class="rails" title="螢幕、SSD、Wi-Fi、喇叭、電源轉換損耗等，不是這個程式能控制的">晶片外（螢幕等）${W(w.board)} W</div>`);
 }
 const STEP = { asr: '語音辨識', punct: '加標點', spk: '分辨講者', notes: '整理筆記', live: '即時錄音' };
 const fmtSec = s => s >= 3600 ? `${Math.floor(s / 3600)} 時 ${Math.floor(s % 3600 / 60)} 分` : s >= 60 ? `${Math.floor(s / 60)} 分 ${s % 60} 秒` : `${s} 秒`;
@@ -170,7 +174,7 @@ function energyHtml(e) {
   const ks = ['live', 'asr', 'punct', 'spk', 'notes'].filter(k => e && e[k]);
   if (!ks.length) return '';
   const tot = ks.reduce((a, k) => a + e[k].wh.system, 0);
-  return `<div class="energy" title="整機耗電包含螢幕和背景程式；括號內是 NPU／CPU 各自用的電">耗電：${ks.map(k => `<span>${STEP[k]}${e[k].engine === 'geniex' && (k === 'asr' || k === 'live') ? '（NPU）' : ''} ${fmtSec(e[k].sec)}，平均 ${e[k].avg_w} W，${Wh(e[k].wh.system)}（NPU ${Wh(e[k].wh.npu)}／CPU ${Wh(e[k].wh.cpu)}）</span>`).join('')}${ks.length > 1 ? `<span>合計 ${Wh(tot)}</span>` : ''}</div>`;
+  return `<div class="energy" title="整機耗電包含螢幕、SSD、Wi-Fi 和背景程式；括號內是晶片（SoC）和其中 NPU／CPU 各自用的電">耗電：${ks.map(k => `<span>${STEP[k]}${e[k].engine === 'geniex' && (k === 'asr' || k === 'live') ? '（NPU）' : ''} ${fmtSec(e[k].sec)}，平均 ${e[k].avg_w} W，${Wh(e[k].wh.system)}（${e[k].wh.soc != null ? `晶片 ${Wh(e[k].wh.soc)}：` : ''}NPU ${Wh(e[k].wh.npu)}／CPU ${Wh(e[k].wh.cpu)}）</span>`).join('')}${ks.length > 1 ? `<span>合計 ${Wh(tot)}</span>` : ''}</div>`;
 }
 
 // ---------- 匯入 ----------
