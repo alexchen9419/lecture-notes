@@ -331,11 +331,12 @@ SPK_FILE = '講者.json'          # {'turns': [[開始, 結束, 編號]...], 'na
 SPK_RX = re.compile(r'^(\[\d{2}:\d{2}:\d{2}\]\s*)【([^】]{1,12})】\s*')
 
 def diar_available():
-    if CFG.get('diarize') is False or os.environ.get('LECTURE_DIARIZE') == '0': return False
     if not (os.path.exists(DIAR_SEG) and os.path.exists(DIAR_EMB)): return False
     try: import sherpa_onnx; return True
     except Exception: return False
-DIAR = diar_available()
+DIAR_OK = diar_available()           # 元件和模型有裝：網頁上可以手動按「分辨講者」
+# 預設不自動分辨（真實教室錄音不一定分得準，還會多花時間）；config.json 寫 "diarize": true 才會每堂課自動做
+DIAR = DIAR_OK and (os.environ.get('LECTURE_DIARIZE') == '1' or (CFG.get('diarize') is True and os.environ.get('LECTURE_DIARIZE') != '0'))
 # 門檻越低分得越細。實際的教室錄音（遠、有回音）用 0.5 會把老師拆成十幾個人，0.8 比較剛好
 DIAR_THR = float(CFG.get('diar_threshold') or 0.8)
 DIAR_MIN_SEC = float(CFG.get('diar_min_sec') or 3)        # 整堂課講不到這麼多秒的「講者」多半是雜音、笑聲，併給前一個人
@@ -944,7 +945,7 @@ class H(BaseHTTPRequestHandler):
                             'job': JOBS.get(lid)})
             return self.send(200, out)
         if path == '/api/config':
-            return self.send(200, {'llm': LLM_MODE != 'none', 'llm_mode': LLM_MODE, 'asr': ASR_ENGINE, 'tea': TEA, 'power': POWER.ok, 'diarize': DIAR})
+            return self.send(200, {'llm': LLM_MODE != 'none', 'llm_mode': LLM_MODE, 'asr': ASR_ENGINE, 'tea': TEA, 'power': POWER.ok, 'diarize': DIAR_OK, 'diarize_auto': DIAR})
         if path == '/api/power':
             return self.send(200, {'ok': POWER.ok, 'w': POWER.watts() if POWER.ok else None, 'error': POWER.err})
         if path == '/api/live':
@@ -1068,6 +1069,7 @@ class H(BaseHTTPRequestHandler):
             if not lid or step not in ('asr', 'punct', 'spk', 'notes', 'all'): return self.send(400, {'error': '參數錯誤'})
             if JOBS.get(lid) and not JOBS[lid]['done']: return self.send(409, {'error': '這堂課已經在處理中'})
             if 'keywords' in q: m = meta_of(lid); m['keywords'] = q['keywords']; save_meta(lid, m)
+            if step == 'spk' and not DIAR_OK: return self.send(400, {'error': '沒有安裝分辨講者的元件，請重新執行 安裝.bat'})
             if step == 'spk':             # 重新分辨講者：丟掉舊的分段（名字保留），標完再重寫筆記
                 info = spk_info(lid)
                 if info: info.pop('turns', None); write(os.path.join(LECT, lid, SPK_FILE), json.dumps(info, ensure_ascii=False))

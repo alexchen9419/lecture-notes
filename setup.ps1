@@ -140,8 +140,8 @@ if ($asrChoice -eq '2') {
 }
 
 # ---------- 3b. 分辨講者（sherpa-onnx，CPU；約 60 MB） ----------
-$diar = Ask "`n  要分辨講者嗎？（逐字稿會標出老師、學生，約 60 MB）(Y/n)" 'SETUP_DIAR'
-$useDiar = ($diar -ne 'n' -and $diar -ne 'N')
+$diar = Ask "`n  要自動分辨講者嗎？（逐字稿會標出老師、學生；教室收音不好時不一定準；約 60 MB）(y/N)" 'SETUP_DIAR'
+$useDiar = ($diar -eq 'y' -or $diar -eq 'Y')
 if ($useDiar) {
     try {
         $plat = $(if ($arm) { 'win_arm64' } else { 'win_amd64' })
