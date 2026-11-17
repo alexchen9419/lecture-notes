@@ -3,3 +3,5 @@
 *.wav binary
 # PowerShell 5.1 要有 BOM 才認得 UTF-8
 *.ps1 -text
+# shell 腳本一定要 LF，不然 Linux 跑不起來
+*.sh text eol=lf

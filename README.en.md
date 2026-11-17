@@ -39,7 +39,7 @@ Measured on a 58-second mixed Chinese–English test lecture on a Snapdragon X2 
 
 ## Install
 
-Requires Windows 10 or 11 on x64 (Intel or AMD) or ARM64 (Snapdragon). 16 GB RAM is recommended; with 8 GB, pick the small model. It needs about 8 GB of disk space.
+Runs on Windows 10 or 11 and on Linux, x64 or ARM64. The steps below are for Windows; see [Linux](#linux) further down. 16 GB RAM is recommended; with 8 GB, pick the small model. It needs about 8 GB of disk space.
 
 1. Get the files: download the [latest release](../../releases/latest), or use **Code → Download ZIP**, or `git clone`.
 2. Double-click **安裝.bat** (Install). It downloads everything into the folder:
@@ -52,6 +52,19 @@ Requires Windows 10 or 11 on x64 (Intel or AMD) or ARM64 (Snapdragon). 16 GB RAM
 3. Double-click **上課筆記.bat** (Lecture Notes). Your browser opens http://127.0.0.1:18484/.
 
 The installer changes no system settings. To uninstall, delete the folder.
+
+### Linux
+
+Needs Python 3.9+, ffmpeg and curl (`sudo apt install python3 ffmpeg curl` on Ubuntu).
+
+```bash
+git clone https://github.com/alexchen9419/lecture-notes.git
+cd lecture-notes
+bash install.sh
+./lecture.sh
+```
+
+Then open http://127.0.0.1:18484/. The installer downloads the official llama.cpp build (CPU or Vulkan), TEA-ASR and the LLM you pick into the folder. There is no NPU, Breeze-ASR or power meter on Linux. Live recording uses the default PulseAudio/PipeWire input; set `"mic"` in `config.json` to ffmpeg input arguments to change it. Tested in an Ubuntu 24.04 ARM64 container (install, import, diarization, notes); x64, Vulkan and live recording are untested.
 
 ### Using the NPU
 

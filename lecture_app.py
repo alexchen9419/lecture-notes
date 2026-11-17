@@ -17,7 +17,8 @@ def cfg_path(key, default): return rel(CFG.get(key) or default)
 def arg(p): return os.path.relpath(p, ROOT) if os.path.abspath(p).lower().startswith(ROOT.lower() + os.sep) else p
 LECT = os.environ.get('LECTURE_DIR') or cfg_path('lectures_dir', '課堂')     # 測試時可以換資料夾
 WHISPER_DIR = cfg_path('whisper_dir', os.path.join('cpu', 'Release'))
-CLI = os.path.join(WHISPER_DIR, 'whisper-cli.exe')
+EXE = '.exe' if os.name == 'nt' else ''          # Linux、Termux 的執行檔沒有副檔名
+CLI = os.path.join(WHISPER_DIR, 'whisper-cli' + EXE)
 MODEL = cfg_path('asr_model', os.path.join('models', 'ggml-breeze-asr-25-q8_0.bin'))
 VAD_MODEL = cfg_path('vad_model', os.path.join('models', 'ggml-silero-v5.1.2.bin'))
 FFMPEG = cfg_path('ffmpeg', 'ffmpeg') if CFG.get('ffmpeg') else 'ffmpeg'
@@ -587,7 +588,7 @@ def _find_cpu_server():
     exe = ASR_CFG.get('fallback_server')
     if exe: return rel(exe) if os.path.exists(rel(exe)) else None
     for dp, _, fs in os.walk(os.path.join(ROOT, 'runtime', 'llama')):
-        if 'llama-server.exe' in fs: return os.path.join(dp, 'llama-server.exe')
+        if 'llama-server' + EXE in fs: return os.path.join(dp, 'llama-server' + EXE)
 
 def _tea_files():
     if ASR_CFG.get('gguf') and ASR_CFG.get('mmproj'): return rel(ASR_CFG['gguf']), rel(ASR_CFG['mmproj'])
@@ -617,7 +618,7 @@ def stop_cpu_server():
         _cpu['proc'] = None
 
 def llm_url():
-    if LLM_MODE == 'none': raise RuntimeError('沒有設定 AI 模型（只能做逐字稿）；要加標點、整理筆記或提問，請重新執行 安裝.bat')
+    if LLM_MODE == 'none': raise RuntimeError('沒有設定 AI 模型（只能做逐字稿）；要加標點、整理筆記或提問，請重新執行安裝程式')
     with _llm['lock']:
         if _llm['url'] and _alive(_llm['url']): return _llm['url']
         if LLM_MODE == 'geniex':
@@ -823,11 +824,18 @@ ASK_SYS = ('你是助教，根據「課堂片段」回答學生的問題，用�
 def qa_path(lid): return os.path.join(LECT, lid, '提問.json')
 
 # ---------- 即時錄音（後端用 ffmpeg 收音，停頓時把那段送 whisper-server，文字邊錄邊寫進逐字稿.txt） ----------
-SERVER = os.path.join(WHISPER_DIR, 'whisper-server.exe')
+SERVER = os.path.join(WHISPER_DIR, 'whisper-server' + EXE)
 ASR_PORT, RATE, FRAME = 18383, 16000, 480            # 30 ms 一個 frame
 MIN_SEG, MAX_SEG, PAUSE = 4.0, 20.0, 0.6
 HALLU = re.compile(r'^(謝謝(大家)?(觀看|收看|收聽)|請不吝點贊|訂閱|字幕|多謝|thank you|thanks for watching)', re.I)
 LIVE = {'sess': None}
+
+def mic_input():
+    """ffmpeg 收麥克風的參數。Windows 用 DirectShow 的第一支麥克風；Linux 預設用 PulseAudio／PipeWire 的預設輸入。
+    config.json 的 "mic" 可以自己指定，例如 ["-f", "alsa", "-i", "hw:0"]"""
+    if CFG.get('mic'): return list(CFG['mic'])
+    if os.name == 'nt': return ['-f', 'dshow', '-i', 'audio=' + mic_device()]
+    return ['-f', 'pulse', '-i', 'default']
 
 def mic_device():
     r = subprocess.run([FFMPEG, '-hide_banner', '-list_devices', 'true', '-f', 'dshow', '-i', 'dummy'], capture_output=True)
@@ -857,7 +865,7 @@ class Live:
             else:
                 self.srv.kill(); raise RuntimeError('辨識伺服器沒有啟動')
         # 錄音存成 fragmented m4a：就算程式意外結束，已錄的部分也能播放
-        src = ['-re', '-i', os.environ['LIVE_TEST_FILE']] if os.environ.get('LIVE_TEST_FILE') else ['-f', 'dshow', '-i', 'audio=' + mic_device()]   # 測試用：拿音檔當麥克風
+        src = ['-re', '-i', os.environ['LIVE_TEST_FILE']] if os.environ.get('LIVE_TEST_FILE') else mic_input()   # 測試用：拿音檔當麥克風
         self.ff = subprocess.Popen([FFMPEG, '-hide_banner', '-loglevel', 'error', '-y'] + src + [
                                     '-ac', '1', '-c:a', 'aac', '-b:a', '64k', '-movflags', '+frag_keyframe+empty_moov', os.path.join(self.dir, '錄音.m4a'),
                                     '-ac', '1', '-ar', str(RATE), '-f', 's16le', '-'], stdout=subprocess.PIPE, stdin=subprocess.PIPE)
@@ -1069,7 +1077,7 @@ class H(BaseHTTPRequestHandler):
             if not lid or step not in ('asr', 'punct', 'spk', 'notes', 'all'): return self.send(400, {'error': '參數錯誤'})
             if JOBS.get(lid) and not JOBS[lid]['done']: return self.send(409, {'error': '這堂課已經在處理中'})
             if 'keywords' in q: m = meta_of(lid); m['keywords'] = q['keywords']; save_meta(lid, m)
-            if step == 'spk' and not DIAR_OK: return self.send(400, {'error': '沒有安裝分辨講者的元件，請重新執行 安裝.bat'})
+            if step == 'spk' and not DIAR_OK: return self.send(400, {'error': '沒有安裝分辨講者的元件，請重新執行安裝程式'})
             if step == 'spk':             # 重新分辨講者：丟掉舊的分段（名字保留），標完再重寫筆記
                 info = spk_info(lid)
                 if info: info.pop('turns', None); write(os.path.join(LECT, lid, SPK_FILE), json.dumps(info, ensure_ascii=False))
