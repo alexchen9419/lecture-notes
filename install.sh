@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 上課筆記 安裝程式（Linux）：把 llama.cpp、模型下載到這個資料夾，寫出 config.json。
+# 上課筆記 安裝程式（Linux 和 Android 的 Termux）：把 llama.cpp、模型下載到這個資料夾，寫出 config.json。
 # 只會動這個資料夾裡的 runtime/、models/，不會改系統設定。Windows 請用 安裝.bat。
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; cd "$ROOT"
@@ -23,7 +23,8 @@ get() {   # get <url> <dest>：已經有就跳過，可續傳
     mv -f "$2.part" "$2"
 }
 
-head_ '=== 上課筆記 安裝（Linux） ==='
+TERMUX=false; case "${PREFIX:-}" in *com.termux*) TERMUX=true ;; esac     # Android 手機上的 Termux
+head_ "=== 上課筆記 安裝（$($TERMUX && echo Termux || echo Linux)） ==="
 
 # ---------- 偵測電腦、檢查需要的程式 ----------
 case "$(uname -m)" in
@@ -31,26 +32,34 @@ case "$(uname -m)" in
     aarch64|arm64) ARCH=arm64 ;;
     *) warn "不支援的 CPU：$(uname -m)（只支援 x86_64 和 arm64）"; exit 1 ;;
 esac
-RAM_GB=$(awk '/MemTotal/ { printf "%d", $2 / 1048576 + 0.5 }' /proc/meminfo 2>/dev/null || echo 0)
-say "電腦：$ARCH，記憶體 ${RAM_GB} GB"
-[ "$RAM_GB" -gt 0 ] && [ "$RAM_GB" -lt 8 ] && warn '注意：記憶體少於 8 GB，語音辨識和 AI 模型可能跑不動。'
-
 missing=()
 for c in python3 ffmpeg ffprobe curl tar; do command -v "$c" >/dev/null 2>&1 || missing+=("$c"); done
 if [ ${#missing[@]} -gt 0 ]; then
     warn "缺少：${missing[*]}，請先安裝再重新執行："
+    if $TERMUX; then say '  pkg install python ffmpeg curl tar'; exit 1; fi
     say '  Debian／Ubuntu：sudo apt install python3 ffmpeg curl tar'
     say '  Fedora：        sudo dnf install python3 ffmpeg curl tar'
     say '  Arch：          sudo pacman -S python ffmpeg curl tar'
     exit 1
 fi
 python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' || { warn '需要 Python 3.9 以上'; exit 1; }
+RAM_GB=$(python3 -c "
+try: print(round(int(next(l for l in open('/proc/meminfo') if l.startswith('MemTotal')).split()[1]) / 1048576))
+except Exception: print(0)")
+say "裝置：$ARCH，記憶體 ${RAM_GB} GB"
+if [ "$RAM_GB" -gt 0 ] && [ "$RAM_GB" -lt 8 ]; then warn '注意：記憶體少於 8 GB，語音辨識和 AI 模型可能跑不動。'; fi
+if $TERMUX && [ "$ARCH" != arm64 ]; then warn 'Termux 只支援 arm64 的手機'; exit 1; fi
+if $TERMUX; then say '手機上跑會比電腦慢很多，處理時請插電。模型共約 5.5 GB，請確認空間夠。'; fi
 
 # ---------- 1. llama.cpp（語音辨識和 AI 模型都用它） ----------
 head_ '[1/4] llama.cpp'
 GPU_LAYERS=0; BUILD="ubuntu-$ARCH"
-a=$(ask '  有支援 Vulkan 的顯示卡，要用 GPU 加速嗎？（跑不起來程式會自動改用 CPU）(y/N)' SETUP_GPU)
-if [ "$a" = y ] || [ "$a" = Y ]; then BUILD="ubuntu-vulkan-$ARCH"; GPU_LAYERS=99; fi
+if $TERMUX; then
+    BUILD=android-arm64                 # 官方的 Android 版，只用 CPU
+else
+    a=$(ask '  有支援 Vulkan 的顯示卡，要用 GPU 加速嗎？（跑不起來程式會自動改用 CPU）(y/N)' SETUP_GPU)
+    if [ "$a" = y ] || [ "$a" = Y ]; then BUILD="ubuntu-vulkan-$ARCH"; GPU_LAYERS=99; fi
+fi
 LNAME="llama-$LLAMA_TAG-bin-$BUILD.tar.gz"
 get "https://github.com/ggml-org/llama.cpp/releases/download/$LLAMA_TAG/$LNAME" "$DL/$LNAME"
 if [ ! -d "$RT/llama" ] || [ -z "$(find "$RT/llama" -name llama-server -type f 2>/dev/null | head -1)" ]; then
@@ -80,8 +89,8 @@ get "$TEA_REPO/$TEA_GGUF" "$MD/$TEA_GGUF"
 get "$TEA_REPO/$TEA_MMPROJ" "$MD/$TEA_MMPROJ"
 
 # ---------- 3b. 分辨講者（選用） ----------
-USE_DIAR=false
-a=$(ask $'\n  要自動分辨講者嗎？（逐字稿會標出老師、學生；教室收音不好時不一定準；約 60 MB）(y/N)' SETUP_DIAR)
+USE_DIAR=false; a=n          # Termux 沒有 sherpa-onnx 可以用，不問
+$TERMUX || a=$(ask $'\n  要自動分辨講者嗎？（逐字稿會標出老師、學生；教室收音不好時不一定準；約 60 MB）(y/N)' SETUP_DIAR)
 if [ "$a" = y ] || [ "$a" = Y ]; then
     if python3 - "$RT/pylib" "$MD/diar" "$SHERPA_VER" <<'PY'
 import sys, os, json, io, zipfile, tarfile, platform, shutil, urllib.request
@@ -121,7 +130,7 @@ say '  1. Gemma 4 E4B（推薦；約 4.8 GB，建議 16 GB 記憶體）'
 say '  2. Gemma 4 E2B（輕量；約 3 GB，8 GB 記憶體也能用，筆記品質差一點）'
 say '  3. 用電腦上已經在跑的 Ollama 或 LM Studio'
 say '  4. 不用 AI，只做逐字稿'
-DEF=1; [ "$RAM_GB" -gt 0 ] && [ "$RAM_GB" -lt 12 ] && DEF=2
+DEF=1; if $TERMUX || { [ "$RAM_GB" -gt 0 ] && [ "$RAM_GB" -lt 12 ]; }; then DEF=2; fi
 choice=$(ask "選擇（直接按 Enter = $DEF）" SETUP_LLM); choice=${choice:-$DEF}
 LLM_MODE=none; LLM_GGUF=; LLM_URL=; LLM_MODEL=
 case "$choice" in
@@ -140,7 +149,7 @@ esac
 
 # ---------- 寫設定檔 ----------
 LLAMA_SERVER="$LLAMA_SERVER" TEA_GGUF="$MD/$TEA_GGUF" TEA_MMPROJ="$MD/$TEA_MMPROJ" GPU_LAYERS="$GPU_LAYERS" USE_DIAR="$USE_DIAR" \
-LLM_MODE="$LLM_MODE" LLM_GGUF="$LLM_GGUF" LLM_URL="$LLM_URL" LLM_MODEL="$LLM_MODEL" python3 - <<'PY'
+TERMUX="$TERMUX" RAM_GB="$RAM_GB" LLM_MODE="$LLM_MODE" LLM_GGUF="$LLM_GGUF" LLM_URL="$LLM_URL" LLM_MODEL="$LLM_MODEL" python3 - <<'PY'
 import os, json
 e = os.environ; gpu = int(e['GPU_LAYERS'])
 llm = {'mode': e['LLM_MODE']}
@@ -149,13 +158,16 @@ if llm['mode'] == 'openai': llm.update(url=e['LLM_URL'], model=e['LLM_MODEL'])
 cfg = {'lectures_dir': '課堂', 'port': 18484,
        'asr': {'engine': 'llama-server', 'server': e['LLAMA_SERVER'], 'gguf': e['TEA_GGUF'], 'mmproj': e['TEA_MMPROJ'], 'port': 18487, 'gpu_layers': gpu},
        'llm': llm, 'diarize': e['USE_DIAR'] == 'true'}
+if e['TERMUX'] == 'true' or 0 < int(e['RAM_GB']) < 12: cfg['low_memory'] = True     # 語音模型和 AI 模型不同時載入
+if e['TERMUX'] == 'true': cfg['live'] = False       # 手機上不能即時錄音，用錄音 App 錄好再匯入
 json.dump(cfg, open('config.json', 'w', encoding='utf-8'), ensure_ascii=False, indent=4)
 PY
 
 # ---------- 測試程式能不能跑 ----------
 head_ '測試程式…'
-if "$LLAMA_SERVER" --version >/dev/null 2>&1; then say '  llama.cpp OK'
+if LD_LIBRARY_PATH="$(dirname "$LLAMA_SERVER")${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$LLAMA_SERVER" --version >/dev/null 2>&1; then say '  llama.cpp OK'
+elif $TERMUX; then warn '  llama.cpp 無法執行：這支手機的 CPU 或 Android 版本可能太舊'
 else warn '  llama.cpp 無法執行：系統的 glibc 可能太舊（官方版本是在 Ubuntu 22.04 上編譯的），或缺少 libgomp1（sudo apt install libgomp1）'; fi
 chmod +x "$ROOT/lecture.sh" 2>/dev/null || true
 
-say $'\n\033[32m安裝完成！執行 ./lecture.sh 就能開始用（瀏覽器開 http://127.0.0.1:18484/）。\033[0m\n'
+say $'\n\033[32m安裝完成！執行 bash lecture.sh 就能開始用（瀏覽器開 http://127.0.0.1:18484/）。\033[0m\n'

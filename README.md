@@ -19,7 +19,7 @@
 
 ## 安裝
 
-Windows 10／11 和 Linux 都可以用，x64（Intel、AMD）或 ARM64 都支援。下面是 Windows 的步驟，Linux 見[下一節](#linux)。建議 16 GB 記憶體，8 GB 請選輕量的 AI 模型。硬碟需要約 8 GB。
+Windows 10／11、Linux 和 Android（Termux）都可以用。下面是 Windows 的步驟，其他見 [Linux](#linux)、[Android 手機（Termux）](#android-手機termux)。建議 16 GB 記憶體，8 GB 請選輕量的 AI 模型。硬碟需要約 8 GB。
 
 1. 下載這個專案：到 [Releases](../../releases/latest) 下載 zip 解壓縮（或按 **Code → Download ZIP**、用 `git clone`）。路徑可以有中文。
 2. 點兩下 **安裝.bat**，照畫面選擇：
@@ -42,7 +42,7 @@ Windows 10／11 和 Linux 都可以用，x64（Intel、AMD）或 ARM64 都支援
 git clone https://github.com/alexchen9419/lecture-notes.git
 cd lecture-notes
 bash install.sh
-./lecture.sh
+bash lecture.sh
 ```
 
 然後用瀏覽器開 http://127.0.0.1:18484/ 。安裝程式會下載 llama.cpp 官方編譯好的版本（Ubuntu 22.04 以上的 glibc）、TEA-ASR 和你選的 AI 模型，都放在這個資料夾裡。
@@ -50,6 +50,26 @@ bash install.sh
 - 語音辨識和 AI 模型都用 llama.cpp 跑，可以選 Vulkan 版用顯示卡加速。Linux 版沒有 NPU 和 Breeze-ASR 的選項，也不顯示功耗。
 - 即時錄音預設用 PulseAudio／PipeWire 的預設麥克風。要換裝置，在 `config.json` 加上 `"mic"`，內容是 ffmpeg 的輸入參數，例如 `["-f", "alsa", "-i", "hw:0"]`。
 - 在 Ubuntu 24.04（ARM64）的容器裡測過安裝、匯入音檔、分辨講者和整理筆記；x64、Vulkan 和即時錄音還沒實測。
+
+### Android 手機（Termux）
+
+從 [F-Droid](https://f-droid.org/packages/com.termux/) 安裝 Termux（Google Play 的版本太舊），打開後輸入：
+
+```bash
+pkg install python ffmpeg curl tar git
+git clone https://github.com/alexchen9419/lecture-notes.git
+cd lecture-notes
+bash install.sh
+bash lecture.sh
+```
+
+然後用手機瀏覽器開 http://127.0.0.1:18484/ 。
+
+- 需要 ARM64 的手機，建議 12 GB 記憶體、至少 8 GB；模型共約 5.5 GB（TEA-ASR 2.5 GB＋Gemma 4 E2B 約 3 GB）。
+- 全部用 CPU 跑，會比電腦慢很多，處理時請插電。語音模型和 AI 模型會輪流載入，不會同時佔記憶體。
+- 不能即時錄音：用手機的錄音 App 錄好，再從網頁匯入音檔。也沒有分辨講者和功耗顯示。
+- 有裝 Termux:API 的話，啟動時會自動開瀏覽器，並防止 Android 在背景把程式停掉。
+- 目前只在 Termux 官方的 Docker 映像（ARM64）裡測過安裝、匯入音檔和整理筆記，**還沒在真的手機上測過**，速度和穩定性不確定。
 
 ## 使用
 

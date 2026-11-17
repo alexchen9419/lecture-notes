@@ -169,6 +169,8 @@ def worker():
             if LLM_MODE == 'none': steps = [s for s in steps if s in ('asr', 'spk')]      # 沒有 AI 模型就只做逐字稿
             for s in steps:
                 mark = POWER.mark()
+                if LOW_MEM and s == 'asr': stop_proc(_llm)        # 記憶體小：語音模型和 AI 模型不要同時載入
+                if LOW_MEM and s in ('punct', 'notes'): stop_proc(_asr)
                 try: {'asr': run_asr_tea if TEA else run_asr, 'punct': run_punct, 'spk': run_spk, 'notes': run_notes}[s](lid)
                 except Exception as e:
                     if s != 'spk': raise
@@ -521,8 +523,15 @@ def _alive(url):
     try: urllib.request.urlopen(url + '/v1/models', timeout=2); return True
     except Exception: return False
 
+def lib_env(exe):
+    """Linux、Termux：llama-server 的 .so 跟執行檔放在一起，要把那個資料夾加進 LD_LIBRARY_PATH 才找得到（Android 版一定要）"""
+    if os.name == 'nt': return None
+    d = os.path.dirname(os.path.abspath(os.path.join(ROOT, exe))); env = dict(os.environ)
+    env['LD_LIBRARY_PATH'] = d + (os.pathsep + env['LD_LIBRARY_PATH'] if env.get('LD_LIBRARY_PATH') else '')
+    return env
+
 def _start_and_wait(cmd, url, secs, what):
-    _llm['proc'] = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=ROOT)
+    _llm['proc'] = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=ROOT, env=lib_env(cmd[0]))
     for _ in range(secs):
         time.sleep(1)
         if _llm['proc'].poll() is not None: raise RuntimeError(f'{what} 啟動失敗')
@@ -549,6 +558,16 @@ def geniex_server(port=18282):
         raise RuntimeError('GenieX 開不起來（NPU 可能卡住了，可以重開機再試）')
 
 _asr = {'proc': None, 'url': None, 'lock': threading.Lock()}
+LOW_MEM = bool(CFG.get('low_memory'))          # 手機或記憶體小的電腦：安裝程式會設成 true
+
+def stop_proc(st):
+    """關掉自己開的 llama-server（下次用到會再開）"""
+    with st['lock']:
+        if st.get('proc') and st['proc'].poll() is None:
+            st['proc'].terminate()
+            try: st['proc'].wait(timeout=15)
+            except Exception: st['proc'].kill()
+        st['proc'] = None; st['url'] = None
 
 def asr_server():
     """TEA-ASR 的伺服器網址：geniex → 自己開的 GenieX（NPU）；llama-server → 另外開一個 llama-server 專門跑 TEA-ASR。"""
@@ -561,7 +580,7 @@ def asr_server():
                '-c', '4096']
         def start(ngl):
             if _asr['proc'] and _asr['proc'].poll() is None: _asr['proc'].kill(); _asr['proc'].wait()
-            _asr['proc'] = subprocess.Popen(cmd + ['-ngl', str(ngl)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=ROOT)
+            _asr['proc'] = subprocess.Popen(cmd + ['-ngl', str(ngl)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=ROOT, env=lib_env(server))
             for _ in range(180):
                 time.sleep(1)
                 if _asr['proc'].poll() is not None: raise RuntimeError('語音辨識伺服器（llama-server）啟動失敗')
@@ -605,7 +624,7 @@ def asr_cpu_server():
         if not (exe and gguf): return None
         print('有一段 NPU 辨識不出來，開 CPU 的 llama-server 補辨識', flush=True)
         _cpu['proc'] = subprocess.Popen([exe, '-m', gguf, '--mmproj', mmproj, '--host', '127.0.0.1', '--port', str(port), '-c', '4096', '-ngl', '0'],
-                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=ROOT)
+                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=ROOT, env=lib_env(exe))
         for _ in range(120):
             time.sleep(1)
             if _cpu['proc'].poll() is not None: return None
@@ -829,6 +848,7 @@ ASR_PORT, RATE, FRAME = 18383, 16000, 480            # 30 ms 一個 frame
 MIN_SEG, MAX_SEG, PAUSE = 4.0, 20.0, 0.6
 HALLU = re.compile(r'^(謝謝(大家)?(觀看|收看|收聽)|請不吝點贊|訂閱|字幕|多謝|thank you|thanks for watching)', re.I)
 LIVE = {'sess': None}
+LIVE_OK = CFG.get('live', True)        # Termux 沒有 ffmpeg 能直接收的麥克風，安裝程式會寫 "live": false，網頁就不顯示即時錄音
 
 def mic_input():
     """ffmpeg 收麥克風的參數。Windows 用 DirectShow 的第一支麥克風；Linux 預設用 PulseAudio／PipeWire 的預設輸入。
@@ -953,7 +973,7 @@ class H(BaseHTTPRequestHandler):
                             'job': JOBS.get(lid)})
             return self.send(200, out)
         if path == '/api/config':
-            return self.send(200, {'llm': LLM_MODE != 'none', 'llm_mode': LLM_MODE, 'asr': ASR_ENGINE, 'tea': TEA, 'power': POWER.ok, 'diarize': DIAR_OK, 'diarize_auto': DIAR})
+            return self.send(200, {'llm': LLM_MODE != 'none', 'llm_mode': LLM_MODE, 'asr': ASR_ENGINE, 'tea': TEA, 'power': POWER.ok, 'diarize': DIAR_OK, 'diarize_auto': DIAR, 'live': bool(LIVE_OK)})
         if path == '/api/power':
             return self.send(200, {'ok': POWER.ok, 'w': POWER.watts() if POWER.ok else None, 'error': POWER.err})
         if path == '/api/live':
@@ -1058,6 +1078,7 @@ class H(BaseHTTPRequestHandler):
             if lid and os.path.exists(qa_path(lid)): os.remove(qa_path(lid))
             return self.send(200, {'ok': True})
         if path == '/api/live/start':
+            if not LIVE_OK: return self.send(400, {'error': '這個裝置不支援即時錄音，請用錄音 App 錄好再匯入'})
             if LIVE['sess']: return self.send(409, {'error': '已經在錄音了'})
             name = re.sub(r'[\\/:*?"<>|]', '', q.get('name', '')).strip()[:40]
             try: LIVE['sess'] = Live(name, q.get('keywords', '').strip())

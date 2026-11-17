@@ -154,6 +154,10 @@ fetch('/api/config').then(r => r.json()).then(c => {
     document.querySelector('#drop p').textContent = `匯入音檔（m4a、mp3、wav…），會自動${c.asr === 'geniex' ? '用 NPU ' : ''}轉逐字稿（含標點）、整理筆記。也可以把檔案拖到這裡。`;
   }
   if (c.diarize_auto) $('#lnotesLabel').textContent = $('#lnotesLabel').textContent.replace('結束後自動', '結束後自動分辨講者、');
+  if (c.live === false) {        // 手機（Termux）：不能即時錄音
+    $('#live').innerHTML = '<p>這個裝置不支援即時錄音。請用手機的錄音 App 錄好，再從下面匯入音檔。</p>';
+    const em = document.querySelector('#main .empty'); if (em) em.innerHTML = '從上面匯入音檔，或選一堂課。';
+  }
   if (c.power) { $('#pw').hidden = false; pollPower(); setInterval(pollPower, 1000); }
 }).catch(() => {});
 const W = v => v == null ? '–' : v < 10 ? v.toFixed(2) : v.toFixed(1);
